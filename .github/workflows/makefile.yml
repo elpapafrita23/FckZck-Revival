@@ -1,0 +1,42 @@
+- name: Build DEB package
+  # You may pin to the exact commit or the version.
+  # uses: DevChall-by-SDCY-and-VXM/debian-buildpackage-template@66fa246e5413db3c4e145307f176ba8aa82546aa
+  uses: DevChall-by-SDCY-and-VXM/debian-buildpackage-template@v0.0.13
+  with:
+    # The Debian-based Linux distribution to build the package for
+Used in Dockerfile
+
+    distro: # default is debian:latest
+    # The architecture to build the package for
+
+    arch: # default is amd64
+    # Arguments to pass to the command dpkg-buildpackage
+
+    build_arguments: # default is -b
+    # Options to pass to the build process (via DEB_BUILD_OPTIONS)
+
+    build_options: # default is 
+    # Options to pass to the build process (via DEB_BUILD_PROFILES)
+
+    build_profiles: # default is 
+    # The GPG key to use for signing the package
+
+    gpg_signing_key: # optional
+    # Overrides the name of the package to build
+
+    package_name: # optional
+    # Overrides the version of the package to build
+
+    package_version: # optional
+    # Overrides the maintainer of the package maintainer
+The syntax is Maintainer Name <maintainer@email>
+Maintainer must match the owner of gpg_signing_key (if specified)
+
+    package_maintainer: # optional
+    # Set the package class
+Available classes are (s) single, (i) arch-independent, (l) library, (p) python
+
+    package_class: # default is s
+    # Generate the .orig source package
+
+    package_generate_orig: # optional
