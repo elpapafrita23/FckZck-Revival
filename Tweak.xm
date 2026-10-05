@@ -66,6 +66,9 @@ static void hookSymbol(MSImageRef image, const char *name, void *replacement, vo
 }
 
 %ctor {
+    // Activa los %hook de clases (obligatorio cuando se define un %ctor propio)
+    %init;
+
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSString *frameworkPath = [bundlePath stringByAppendingPathComponent:@"Frameworks/SharedModules.framework/SharedModules"];
     MSImageRef image = MSGetImageByName([frameworkPath UTF8String]);
