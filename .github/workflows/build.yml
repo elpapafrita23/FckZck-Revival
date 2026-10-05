@@ -7,16 +7,27 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build with Theos
-        uses: Randomblock1/theos-action@v1
+      - name: Instalar dependencias
+        run: brew install ldid dpkg
 
-      - name: Package
+      - name: Instalar Theos
+        run: git clone --recursive --depth=1 https://github.com/theos/theos.git "$THEOS"
+
+      - name: Descargar SDKs de iOS
+        run: |
+          git clone --depth=1 https://github.com/theos/sdks.git /tmp/sdks
+          cp -R /tmp/sdks/*.sdk "$THEOS/sdks/"
+          ls "$THEOS/sdks"
+
+      - name: Compilar y empaquetar
         run: make package FINALPACKAGE=1
 
-      - name: Upload .deb
+      - name: Subir .deb
         uses: actions/upload-artifact@v4
         with:
           name: FckZck-deb
