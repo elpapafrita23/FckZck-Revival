@@ -1030,7 +1030,7 @@ static BOOL FZHookB(Class c, const char *sel, const char *types, IMP (^mk)(IMP *
     if (!m) { FZ(@"FckZck 1.27: %s has no %s", class_getName(c), sel); return NO; }
     const char *e = method_getTypeEncoding(m);
     const char *p = e ? strstr(e, "@0:8") : NULL;
-    if (!p || !p[4] || !strchr(types, p[4])) { FZ(@"FckZck 1.27: %s %s unexpected type %s", class_getName(c), sel, e ? e : "?"); return NO; }
+    if (!p || (types[0] && (!p[4] || !strchr(types, p[4])))) { FZ(@"FckZck 1.27: %s %s unexpected type %s", class_getName(c), sel, e ? e : "?"); return NO; }
     IMP *slot = (IMP *)calloc(1, sizeof(IMP));
     MSHookMessageEx(c, s, mk(slot, s), slot);
     FZ(@"FckZck 1.27: hooked %s %s (%s)", class_getName(c), sel, e);
@@ -1115,7 +1115,7 @@ static void FZInstallCompanionHooks(void) {
     for (int i = 0; i < 2; i++) {
         Class c = objc_getClass(cls[i]);
         if (!c) continue;
-        FZHookB(c, "companionProps", "@", ^IMP(IMP *slot, SEL s) {
+        FZHookB(c, "companionProps", "", ^IMP(IMP *slot, SEL s) {
             return imp_implementationWithBlock(^id(id self) {
                 id r = ((id (*)(id, SEL))*slot)(self, s);
                 FZ(@"FckZck 1.27: %s.companionProps read (%@)", class_getName([self class]), r ? NSStringFromClass([r class]) : @"nil");
@@ -1124,6 +1124,47 @@ static void FZInstallCompanionHooks(void) {
             });
         });
     }
+}
+
+// ---- 1.27.3: rewrite the CompanionProps bytes inside the ClientPayload right before it is
+// serialized (they are not built through setters in this run: persisted/parsed instead).
+static NSString *gRegKey = nil;
+static void FZTunePayload(id payload) {
+    @try {
+        if (!gRegKey) return;
+        id reg = [payload valueForKey:gRegKey];
+        if (!reg) return;
+        id p = [reg valueForKey:@"companionProps"];
+        if (![p isKindOfClass:[NSData class]] || ![(NSData *)p length]) { FZ(@"FckZck 1.27: payload companionProps empty/not data (%@)", p ? NSStringFromClass([p class]) : @"nil"); return; }
+        NSData *n = FZTuneDevicePropsData((NSData *)p);
+        if (![n isEqualToData:(NSData *)p]) { [reg setValue:n forKey:@"companionProps"]; FZ(@"FckZck 1.27: payload companionProps replaced"); }
+    } @catch (NSException *e) { FZ(@"FckZck 1.27: payload tune exception %@", e); }
+}
+static BOOL gPayloadHooked = NO;
+static void FZInstallPayloadHook(void) {
+    if (gPayloadHooked) return;
+    Class pc = objc_getClass("WAPBClientPayload");
+    Class rc = objc_getClass("WAPBClientPayload_CompanionRegData");
+    if (!pc || !rc) return;
+    gPayloadHooked = YES;
+    unsigned int n = 0;
+    objc_property_t *ps = class_copyPropertyList(pc, &n);
+    NSMutableArray *names = [NSMutableArray array];
+    for (unsigned int i = 0; i < n; i++) {
+        const char *nm = property_getName(ps[i]);
+        const char *at = property_getAttributes(ps[i]);
+        if (nm) [names addObject:@(nm)];
+        if (nm && at && strstr(at, "WAPBClientPayload_CompanionRegData")) gRegKey = @(nm);
+    }
+    free(ps);
+    FZ(@"FckZck 1.27: ClientPayload props: %@ | regData key=%@", [names componentsJoinedByString:@" "], gRegKey);
+    FZHookB(pc, "data", "", ^IMP(IMP *slot, SEL s) {
+        return imp_implementationWithBlock(^id(id self) {
+            FZ(@"FckZck 1.27: ClientPayload.data called");
+            FZTunePayload(self);
+            return ((id (*)(id, SEL))*slot)(self, s);
+        });
+    });
 }
 
 static int gPropsHooks = 0;
@@ -1158,6 +1199,7 @@ static void FZScanDeviceProps(void) {
 static void FZScanLoop(int left) {
     FZScanDeviceProps();
     FZInstallCompanionHooks();
+    FZInstallPayloadHook();
     if (left > 0) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ FZScanLoop(left - 1); });
     else FZ(@"FckZck 1.27: scan finished, hooks=%d", gPropsHooks);
 }
@@ -1165,7 +1207,7 @@ static void FZScanLoop(int left) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.27.2 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.27.3 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
