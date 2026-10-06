@@ -953,7 +953,7 @@ static void FZPBPut(NSMutableData *d, uint64_t v) {
 // fields: array of @{f, w, v(NSNumber|NSData)}
 static NSMutableArray *FZPBParse(NSData *d) {
     NSMutableArray *out = [NSMutableArray array];
-    const uint8_t *b = d.bytes; NSUInteger n = d.length, i = 0;
+    const uint8_t *b = (const uint8_t *)d.bytes; NSUInteger n = d.length, i = 0;
     while (i < n) {
         uint64_t tag, v;
         if (!FZPBVarint(b, n, &i, &tag)) return nil;
