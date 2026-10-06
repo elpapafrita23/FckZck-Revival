@@ -778,14 +778,17 @@ static BOOL FZInstallSignalHooks(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.17.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.18.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!FZInstallUserAgentHooks()) FZ(@"FckZck: WAPBClientPayload_UserAgent still not found");
         });
     }
-    // class dump disabled in 1.12 (classes3 already captured); re-enable FZDumpClassesMatching(...) if needed
+    // 1.18: one-off dump of the history-sync / bootstrap classes (names, selectors, type encodings)
+    // -> <app Documents>/fckzck-history-classes.txt (written ~20 s after launch)
+    FZDumpClassesMatching(@[@"HistorySync", @"InitialSync", @"InlinePayload", @"WAHistory", @"Bootstrap", @"CompanionSync"],
+                          @"fckzck-history-classes.txt");
     if (!FZInstallSignalHooks()) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!FZInstallSignalHooks()) FZ(@"FckZck: signal classes still not found");
