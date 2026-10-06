@@ -9,22 +9,19 @@
 // Accepts "2.26.38.74" (4 parts) or "26.38.74" (3 parts, a leading 2 is added).
 // The build hash is always the MD5 of the version string.
 #define DEFAULT_VERSION @"2.26.38.74"
-// 1.21: authentication-first test. Keep the local deprecation bypass, but do not
-// spoof the version/build sent to WhatsApp unless explicitly enabled in the plist.
-static BOOL gVersionSpoof = NO;
 static NSString *gVersion = nil;
 static NSString *gHash = nil;
 static int gNum[4] = {2, 26, 38, 74};
 // Experiment: drop an EMPTY <ref-cert> node from the pair-device request.
 // Config key: <key>skipEmptyRefCert</key><true/> to turn it on.
-static NSString *gHistoryMode = @"stock";
+static NSString *gHistoryMode = @"continue";
 static NSNumber *gForceSyncState = nil;  // 1.20 diagnostic: observe the real UI state; do not force it.
 // Experiment (1.11): the app logs itself out ~120 s after pairing because history sync never
 // completes (reason "history_sync_timeout"). When ON, that single logout is swallowed and the
 // bootstrap is told the initial history sync finished instead.
 // Config keys: blockHistoryTimeoutLogout (bool, default ON),
 //              historyTimeoutRemovalReason (integer, default 11 = value seen in log 2).
-static BOOL gBlockHistoryTimeoutLogout = NO;  // 1.21 auth-first: do not mask a server/auth failure with History Sync workarounds.
+static BOOL gBlockHistoryTimeoutLogout = YES;  // 1.20 diagnostic: keep the companion alive at timeout so we can inspect the real state.
 // Experiment (1.12): force WASignalAddress "deprecated" for individual (non-group) sessions.
 // -1 = leave as is, 0 = force NO (default), 1 = force YES. Config key: signalDeprecatedOverride (integer).
 static int gDeprecatedOverride = 0;
@@ -50,8 +47,8 @@ static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping 
 // Experiment: OS version declared to the server in ClientPayload.UserAgent.
 // Config keys (strings): osVersion, osBuildNumber. An EMPTY osVersion disables
 // the override (the real iOS version is sent).
-static NSString *gOsVersion = nil;
-static NSString *gOsBuild = nil;
+static NSString *gOsVersion = @"15.8.3";
+static NSString *gOsBuild = @"19H386";
 
 // ---- File logging -------------------------------------------------------
 // Writes to <app Documents>/fckzck.log (and NSLog). Lets you read the log with
@@ -128,9 +125,6 @@ static void FZLoadConfig(void) {
     id ff = cfg[@"forceFinishBootstrapSeconds"];
     if ([ff isKindOfClass:[NSNumber class]]) gForceFinishSeconds = [ff intValue];
     FZ(@"FckZck: forceFinishBootstrapSeconds=%d", gForceFinishSeconds);
-    id vs = cfg[@"versionSpoof"];
-    if ([vs respondsToSelector:@selector(boolValue)]) gVersionSpoof = [vs boolValue];
-    FZ(@"FckZck: versionSpoof=%d", gVersionSpoof);
     id so = cfg[@"signalDeprecatedOverride"];
     if ([so isKindOfClass:[NSNumber class]]) gDeprecatedOverride = [so intValue];
     FZ(@"FckZck: signalDeprecatedOverride=%d", gDeprecatedOverride);
@@ -173,7 +167,7 @@ static void FZLoadConfig(void) {
     for (int i = 0; i < 4; i++) gNum[i] = nums[i];
     gVersion = [NSString stringWithFormat:@"%d.%d.%d.%d", nums[0], nums[1], nums[2], nums[3]];
     gHash = FZMD5(gVersion);
-    FZ(@"FckZck: configured app version %@ (hash %@), versionSpoof=%d", gVersion, gHash, gVersionSpoof);
+    FZ(@"FckZck: spoofing version %@ (hash %@)", gVersion, gHash);
 }
 
 
@@ -205,13 +199,13 @@ static NSDate *_new_WABuildDate() {
 }
 
 static NSString *_new_WABuildVersion(void *arg1, void *arg2) {
-    FZ(@"_new_WABuildVersion called -> %@", gVersion);
-    return gVersionSpoof ? gVersion : _orig_WABuildVersion(arg1, arg2);
+    FZ(@"_new_WABuildVersion called");
+    return gVersion;
 }
 
 static NSString *_new_WABuildHash() {
     FZ(@"_new_WABuildHash called");
-    return gVersionSpoof ? gHash : _orig_WABuildHash();
+    return gHash;
 }
 
 // The platform-deprecation check: the app asks "is this OS too old?" and,
@@ -400,10 +394,9 @@ static BOOL FZInstallUserAgentHooks(void) {
 //   "stock"              - original behaviour (logout)
 static void (*orig_hsInitial)(id, SEL);
 static void new_hsInitial(id self, SEL _cmd) {
-    FZ(@"FckZck: CompanionBootstrapLoading.handleInitialHistorySync ENTER");
+    FZ(@"FckZck: CompanionBootstrapLoading.handleInitialHistorySync called");
     gInitialCalled = YES;
     orig_hsInitial(self, _cmd);
-    FZ(@"FckZck: CompanionBootstrapLoading.handleInitialHistorySync EXIT");
 }
 
 static void (*orig_hsFailure)(id, SEL, id);
@@ -418,13 +411,13 @@ static void new_hsFailure(id self, SEL _cmd, id reason) {
     }
 }
 
+static void FZLogHistoryServiceObjects(id self, NSString *phase);
+
 static void (*orig_hsHandle)(id, SEL, id, id);
-static NSUInteger gHSMessageCount = 0;
 static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
     gHistSvc = self;
     @try {
-        gHSMessageCount++;
-        NSMutableString *line = [NSMutableString stringWithFormat:@"FckZck: HistorySyncService.handleMessage #%lu class=%@", (unsigned long)gHSMessageCount, NSStringFromClass([msg class])];
+        NSMutableString *line = [NSMutableString stringWithFormat:@"FckZck: HistorySyncService.handleMessage class=%@", NSStringFromClass([msg class])];
         NSArray *paths = @[@"type",
                            @"historySyncNotification.syncType",
                            @"historySyncNotification.chunkOrder",
@@ -432,21 +425,41 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
                            @"historySyncNotification.fileLength",
                            @"historySyncNotification.hasDirectPath",
                            @"historySyncNotification.hasInitialHistBootstrapInlinePayload",
-                           @"historySyncNotification.mediaSize",
-                           @"historySyncNotification.initialHistBootstrapInlinePayload.length",
                            @"appStateSyncKeyShare.keys.@count"];
         for (NSString *kp in paths) {
             id v = nil;
             @try { v = [msg valueForKeyPath:kp]; } @catch (NSException *e) { v = nil; }
-            if (v) [line appendFormat:@" %@=%@", kp, v];
+            if ([v isKindOfClass:[NSNumber class]]) [line appendFormat:@" %@=%@", kp, v];
         }
         FZ(@"%@", line);
-        @try { FZ(@"FckZck: HistorySyncService.handleMessage msg=%@", FZDesc(msg)); } @catch (NSException *e) {}
     } @catch (NSException *e) {}
-    orig_hsHandle(self, _cmd, msg, stanza);
+    // Capture the service state immediately before and after processing this message.
+    // Do not call the hooked selector here; use the original IMP to avoid recursive logging.
     @try {
-        FZ(@"FckZck: HistorySyncService.handleMessage #%lu AFTER", (unsigned long)gHSMessageCount);
-    } @catch (NSException *e) {}
+        if (orig_isInit) {
+            BOOL before = orig_isInit(self, sel_registerName("isInitialSyncFinished"));
+            FZ(@"FckZck: HistorySyncService.handleMessage BEFORE service.isInitialSyncFinished=%d", before);
+        }
+    } @catch (NSException *e) {
+        FZ(@"FckZck: HistorySyncService.handleMessage BEFORE state read exception=%@", e);
+    }
+
+    FZLogHistoryServiceObjects(self, @"BEFORE");
+    orig_hsHandle(self, _cmd, msg, stanza);
+    FZLogHistoryServiceObjects(self, @"AFTER");
+
+    @try {
+        if (orig_isInit) {
+            BOOL after = orig_isInit(self, sel_registerName("isInitialSyncFinished"));
+            FZ(@"FckZck: HistorySyncService.handleMessage AFTER service.isInitialSyncFinished=%d", after);
+        }
+        if ([self respondsToSelector:sel_registerName("currentSyncState")]) {
+            id state = [self valueForKey:@"currentSyncState"];
+            FZ(@"FckZck: HistorySyncService.handleMessage AFTER currentSyncState=%@", state);
+        }
+    } @catch (NSException *e) {
+        FZ(@"FckZck: HistorySyncService.handleMessage AFTER state read exception=%@", e);
+    }
 }
 
 static void (*orig_preKeyFail)(id, SEL, id);
@@ -471,12 +484,11 @@ static long long new_syncState(id self, SEL _cmd) {
 
 static BOOL FZHookIfPresent(Class c, const char *selName, const char *wantEnc, IMP repl, IMP *orig);
 
-// 1.22 diagnostic hooks: observe the complete History Sync state transition.
-// These hooks deliberately do NOT force completion or alter authentication.
+// 1.20 diagnostic hooks discovered from the class dump.
+// These deliberately OBSERVE the real History Sync state; they do not force completion.
 static BOOL (*orig_deviceInitial)(id, SEL);
 static BOOL new_deviceInitial(id self, SEL _cmd) {
     BOOL v = orig_deviceInitial(self, _cmd);
-    FZ(@"FckZck: HistorySyncDevice.isInitialSyncFinished queried -> %d", v);
     static int last = -1;
     if (last != (int)v) { last = (int)v; FZ(@"FckZck: HistorySyncDevice.isInitialSyncFinished=%d", v); }
     return v;
@@ -485,7 +497,6 @@ static BOOL new_deviceInitial(id self, SEL _cmd) {
 static BOOL (*orig_deviceSyncing)(id, SEL);
 static BOOL new_deviceSyncing(id self, SEL _cmd) {
     BOOL v = orig_deviceSyncing(self, _cmd);
-    FZ(@"FckZck: HistorySyncDevice.isSyncing queried -> %d", v);
     static int last = -1;
     if (last != (int)v) { last = (int)v; FZ(@"FckZck: HistorySyncDevice.isSyncing=%d", v); }
     return v;
@@ -494,7 +505,6 @@ static BOOL new_deviceSyncing(id self, SEL _cmd) {
 static BOOL (*orig_deviceCompleted)(id, SEL);
 static BOOL new_deviceCompleted(id self, SEL _cmd) {
     BOOL v = orig_deviceCompleted(self, _cmd);
-    FZ(@"FckZck: HistorySyncDevice.isCompleted queried -> %d", v);
     static int last = -1;
     if (last != (int)v) { last = (int)v; FZ(@"FckZck: HistorySyncDevice.isCompleted=%d", v); }
     return v;
@@ -503,7 +513,6 @@ static BOOL new_deviceCompleted(id self, SEL _cmd) {
 static unsigned int (*orig_initialState)(id, SEL);
 static unsigned int new_initialState(id self, SEL _cmd) {
     unsigned int v = orig_initialState(self, _cmd);
-    FZ(@"FckZck: PBBProtoInitialSyncStateUpdate.state queried -> %u", v);
     static unsigned int last = UINT_MAX;
     if (last != v) { last = v; FZ(@"FckZck: PBBProtoInitialSyncStateUpdate.state=%u", v); }
     return v;
@@ -512,7 +521,6 @@ static unsigned int new_initialState(id self, SEL _cmd) {
 static double (*orig_initialProgress)(id, SEL);
 static double new_initialProgress(id self, SEL _cmd) {
     double v = orig_initialProgress(self, _cmd);
-    FZ(@"FckZck: PBBProtoInitialSyncStateUpdate.progress queried -> %.4f", v);
     static double last = -1.0;
     if (last < 0.0 || fabs(last - v) >= 0.01) { last = v; FZ(@"FckZck: PBBProtoInitialSyncStateUpdate.progress=%.4f", v); }
     return v;
@@ -528,6 +536,24 @@ static void (*orig_pairingTimedOut)(id, SEL, id);
 static void new_pairingTimedOut(id self, SEL _cmd, id notification) {
     FZ(@"FckZck: HistorySyncCompanionDevicesListener.companionPairingTimedOutWithNotification=%@", FZDesc(notification));
     orig_pairingTimedOut(self, _cmd, notification);
+}
+
+static void FZLogHistoryServiceObjects(id self, NSString *phase) {
+    @try {
+        NSArray *keys = @[@"historySyncDevice", @"device", @"initialSyncState", @"syncState", @"stateUpdate"];
+        for (NSString *key in keys) {
+            id value = nil;
+            @try { value = [self valueForKey:key]; } @catch (NSException *e) { continue; }
+            if (value) {
+                FZ(@"FckZck: HistorySyncService.%@ KVC %@ -> class=%@ desc=%@", phase, key, NSStringFromClass([value class]), FZDesc(value));
+                @try {
+                    if ([value respondsToSelector:sel_registerName("isInitialSyncFinished")]) FZ(@"FckZck: HistorySyncService.%@ %@.isInitialSyncFinished=%d", phase, key, (int)((BOOL (*)(id,SEL))objc_msgSend)(value, sel_registerName("isInitialSyncFinished")));
+                    if ([value respondsToSelector:sel_registerName("isSyncing")]) FZ(@"FckZck: HistorySyncService.%@ %@.isSyncing=%d", phase, key, (int)((BOOL (*)(id,SEL))objc_msgSend)(value, sel_registerName("isSyncing")));
+                    if ([value respondsToSelector:sel_registerName("isCompleted")]) FZ(@"FckZck: HistorySyncService.%@ %@.isCompleted=%d", phase, key, (int)((BOOL (*)(id,SEL))objc_msgSend)(value, sel_registerName("isCompleted")));
+                } @catch (NSException *e) {}
+            }
+        }
+    } @catch (NSException *e) {}
 }
 
 static BOOL FZInstallDiagnosticHistoryHooks(void) {
@@ -588,10 +614,8 @@ static BOOL new_isInit(id self, SEL _cmd) {
 }
 static void (*orig_runWhen)(id, SEL, id);
 static void new_runWhen(id self, SEL _cmd, id blk) {
-    FZ(@"FckZck: HistorySyncCompanionService.runWhenInitialSyncFinished ENTER (block=%@)", blk ? @"yes" : @"nil");
-    @try { FZ(@"FckZck: runWhenInitialSyncFinished current=%d", (int)[self isInitialSyncFinished]); } @catch (NSException *e) {}
+    FZ(@"FckZck: HistorySyncCompanionService.runWhenInitialSyncFinished: called (block=%@)", blk ? @"yes" : @"nil");
     orig_runWhen(self, _cmd, blk);
-    @try { FZ(@"FckZck: runWhenInitialSyncFinished EXIT current=%d", (int)[self isInitialSyncFinished]); } @catch (NSException *e) {}
 }
 static void (*orig_didUpdAB)(id, SEL);
 static void new_didUpdAB(id self, SEL _cmd) {
@@ -891,7 +915,7 @@ static BOOL FZInstallSignalHooks(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.21 auth-history test loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.18.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -942,7 +966,7 @@ static BOOL FZInstallSignalHooks(void) {
 	static NSArray *keys;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
-		keys = @[@"md/", @"pair", @"link", @"companion", @"gcm", @"xmpp//", @"stream//", @"LL_E", @"LL_W", @"login", @"auth", @"deprecat", @"expire", @"version", @"signal", @"prekey", @"history-sync", @"logout", @"authenticate", @"401", @"not-authorized"];
+		keys = @[@"md/", @"pair", @"link", @"companion", @"gcm", @"xmpp//", @"stream//", @"LL_E", @"LL_W", @"login", @"auth", @"deprecat", @"expire", @"version", @"signal", @"prekey", @"history-sync", @"logout"];
 	});
 	for (NSString *k in keys) {
 		if ([result rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) {
