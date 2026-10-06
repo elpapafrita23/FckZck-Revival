@@ -116,6 +116,18 @@ static NSString *FZMD5(NSString *text) {
     return out;
 }
 
+// 1.30: pair-device experiments rotate automatically on every link attempt (when the plist does
+// not set skipEmptyRefCert / skipClientProps): 0=stock, 1=no client-props, 2=no ref-cert, 3=both.
+static BOOL gPairAuto = NO;
+static int gPairAttempt = 0;
+static NSString *FZPairAttemptPath(void) {
+    NSArray *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return [[d firstObject] stringByAppendingPathComponent:@"fckzck-pairattempt.txt"];
+}
+static int FZPairMode(void) { return gPairAuto ? (gPairAttempt % 4) : -1; }
+static BOOL FZSkipRef(void)   { return gSkipEmptyRefCert || (gPairAuto && (FZPairMode() & 2)); }
+static BOOL FZSkipProps(void) { return gSkipClientProps  || (gPairAuto && (FZPairMode() & 1)); }
+
 static void FZLoadConfig(void) {
     NSString *wanted = DEFAULT_VERSION;
     NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.ifilipis.fckzck.plist"];
@@ -124,7 +136,9 @@ static void FZLoadConfig(void) {
     if ([skip respondsToSelector:@selector(boolValue)]) gSkipEmptyRefCert = [skip boolValue];
     id skc = cfg[@"skipClientProps"];
     if ([skc respondsToSelector:@selector(boolValue)]) gSkipClientProps = [skc boolValue];
-    FZ(@"FckZck 1.29: skipEmptyRefCert=%d skipClientProps=%d", gSkipEmptyRefCert, gSkipClientProps);
+    gPairAuto = (cfg[@"skipEmptyRefCert"] == nil && cfg[@"skipClientProps"] == nil);
+    gPairAttempt = [[NSString stringWithContentsOfFile:FZPairAttemptPath() encoding:NSUTF8StringEncoding error:nil] intValue];
+    FZ(@"FckZck 1.30: skipEmptyRefCert=%d skipClientProps=%d auto=%d attempt=%d mode=%d", gSkipEmptyRefCert, gSkipClientProps, gPairAuto, gPairAttempt, FZPairMode());
     // 1.26: the 120 s history_sync_timeout logout is blocked by default (plist key
     // blockHistoryTimeoutLogout can turn it off) and the bootstrap is completed by hand.
     gBlockHistoryTimeoutLogout = YES;
@@ -957,7 +971,7 @@ static void FZLoadBundleSpoof(void) {
     if ([sp respondsToSelector:@selector(boolValue)]) gSpoofBundle = [sp boolValue];
     id sv = cfg[@"bundleShortVersion"];
     id bv = cfg[@"bundleVersion"];
-    gBundleShort = ([sv isKindOfClass:[NSString class]] && [sv length]) ? sv : gVersion;
+    gBundleShort = ([sv isKindOfClass:[NSString class]] && [sv length]) ? sv : [NSString stringWithFormat:@"%d.%d.%d", gNum[1], gNum[2], gNum[3]];
     gBundleBuild = ([bv isKindOfClass:[NSString class]] && [bv length]) ? bv
                    : [NSString stringWithFormat:@"%d.%d.%d", gNum[1], gNum[2], gNum[3]];
     NSDictionary *real = [[NSBundle mainBundle] infoDictionary];
@@ -1102,7 +1116,7 @@ static void FZLoadHistoryConfig(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.29 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.30 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     FZLoadBundleSpoof();
     FZInstallBundleHooks();
     FZDumpClassesMatching(@[@"Deprecat", @"Unsupported", @"PlatformSupport", @"OSVersion", @"ExpiredBuild"],
@@ -1238,8 +1252,12 @@ static void FZLoadHistoryConfig(void) {
 }
 
 - (void)handlePairDeviceResponseWithDeviceJID:(id)jid companionProps:(id)companionProps retryTimestamp:(unsigned long long)ts serverError:(id)serverError {
-    FZ(@"FckZck: PAIR response jid=%@ companionProps=%@ retryTimestamp=%llu serverError=%@",
-       FZDesc(jid), FZDesc(companionProps), ts, FZDesc(serverError));
+    FZ(@"FckZck: PAIR response jid=%@ companionProps=%@ retryTimestamp=%llu serverError=%@ (attempt=%d mode=%d)",
+       FZDesc(jid), FZDesc(companionProps), ts, FZDesc(serverError), gPairAttempt, FZPairMode());
+    if (gPairAuto) {
+        gPairAttempt++;
+        [[NSString stringWithFormat:@"%d", gPairAttempt] writeToFile:FZPairAttemptPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
     %orig;
 }
 
@@ -1253,11 +1271,11 @@ static void FZLoadHistoryConfig(void) {
             NSUInteger len = [data isKindOfClass:[NSData class]] ? [(NSData *)data length] : 0;
             NSString *hex = (len > 0 && len <= 4) ? [NSString stringWithFormat:@" bytes=%@", [(NSData *)data description]] : @"";
             FZ(@"FckZck: addChildWithName %@ dataValue=%lu bytes%@", name, (unsigned long)len, hex);
-            if (len == 0 && gSkipEmptyRefCert && [name isEqualToString:@"ref-cert"]) {
+            if (len == 0 && FZSkipRef() && [name isEqualToString:@"ref-cert"]) {
                 FZ(@"FckZck: skipped empty ref-cert");
                 return;
             }
-            if (gSkipClientProps && [name isEqualToString:@"client-props"]) {
+            if (FZSkipProps() && [name isEqualToString:@"client-props"]) {
                 FZ(@"FckZck 1.29: skipped client-props");
                 return;
             }
@@ -1275,11 +1293,11 @@ static void FZLoadHistoryConfig(void) {
                 NSUInteger kids = [[(id<FZElem>)child children] count];
                 NSString *hex = (d.length > 0 && d.length <= 4) ? [NSString stringWithFormat:@" bytes=%@", d] : @"";
                 FZ(@"FckZck: addChild %@ dataValue=%lu bytes children=%lu%@", n, (unsigned long)d.length, (unsigned long)kids, hex);
-                if (gSkipEmptyRefCert && [n isEqualToString:@"ref-cert"] && d.length == 0 && kids == 0) {
+                if (FZSkipRef() && [n isEqualToString:@"ref-cert"] && d.length == 0 && kids == 0) {
                     FZ(@"FckZck: skipped empty ref-cert");
                     return;
                 }
-                if (gSkipClientProps && [n isEqualToString:@"client-props"]) {
+                if (FZSkipProps() && [n isEqualToString:@"client-props"]) {
                     FZ(@"FckZck 1.29: skipped client-props");
                     return;
                 }
