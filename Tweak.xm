@@ -144,11 +144,59 @@ static void hookSymbol(MSImageRef image, const char *name, void *replacement, vo
     }
 }
 
+// ---- Stanza / pairing inspection ------------------------------------------
+// Logs the structure of "iq ns=md" stanzas and every iq error (tags, attribute
+// names/values, and byte LENGTHS of binary payloads -- never the bytes). Digit
+// runs of 6+ (phone numbers, ids) are masked as '#'.
+@protocol FZElem <NSObject>
+- (NSString *)name;
+- (NSDictionary *)attributesStringDictionary;
+- (NSArray *)children;
+- (NSData *)dataValue;
+@end
+
+static NSString *FZMask(NSString *s) {
+    if (!s) return @"";
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:@"[0-9]{6,}" options:0 error:nil];
+    });
+    return [re stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"#"];
+}
+
+static NSString *FZDesc(id o) {
+    if (!o) return @"nil";
+    if ([o isKindOfClass:[NSData class]]) return [NSString stringWithFormat:@"NSData(%lu bytes)", (unsigned long)[(NSData *)o length]];
+    if ([o isKindOfClass:[NSString class]]) return [NSString stringWithFormat:@"NSString(%lu chars)", (unsigned long)[(NSString *)o length]];
+    NSString *x = [NSString stringWithFormat:@"%@", o];
+    if (x.length > 400) x = [x substringToIndex:400];
+    return [NSString stringWithFormat:@"%@ %@", NSStringFromClass([o class]), FZMask(x)];
+}
+
+static void FZDumpElem(id<FZElem> e, int depth, NSMutableString *out) {
+    if (!e || depth > 8) return;
+    NSString *indent = [@"" stringByPaddingToLength:(NSUInteger)(depth * 2) withString:@" " startingAtIndex:0];
+    NSMutableString *attrs = [NSMutableString string];
+    NSDictionary *d = [e respondsToSelector:@selector(attributesStringDictionary)] ? [e attributesStringDictionary] : nil;
+    for (id k in d) {
+        NSString *v = [NSString stringWithFormat:@"%@", d[k]];
+        if (v.length > 60) v = [[v substringToIndex:60] stringByAppendingString:@"..."];
+        [attrs appendFormat:@" %@=\"%@\"", k, FZMask(v)];
+    }
+    NSData *data = [e respondsToSelector:@selector(dataValue)] ? [e dataValue] : nil;
+    NSString *dstr = data.length ? [NSString stringWithFormat:@" [%lu bytes]", (unsigned long)data.length] : @"";
+    [out appendFormat:@"%@<%@%@>%@\n", indent, [e name], attrs, dstr];
+    NSArray *kids = [e respondsToSelector:@selector(children)] ? [e children] : nil;
+    for (id c in kids) FZDumpElem((id<FZElem>)c, depth + 1, out);
+}
+// -------------------------------------------------------------------------
+
 // ---- Class dump (discovery) -----------------------------------------------
 // 20 s after launch, writes the names + method selectors + type encodings of
 // every class related to pairing / companion / ADV / stanzas to
 // <app Documents>/fckzck-classes.txt. Only in the main WhatsApp apps.
-static void FZDumpClasses(void) {
+__attribute__((unused)) static void FZDumpClasses(void) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     if (![bid isEqualToString:@"net.whatsapp.WhatsApp"] && ![bid isEqualToString:@"net.whatsapp.WhatsAppSMB"]) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
@@ -190,8 +238,7 @@ static void FZDumpClasses(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.3.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
-    FZDumpClasses();
+    FZ(@"FckZck 1.4.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSString *frameworkPath = [bundlePath stringByAppendingPathComponent:@"Frameworks/SharedModules.framework/SharedModules"];
     MSImageRef image = MSGetImageByName([frameworkPath UTF8String]);
@@ -262,6 +309,38 @@ static void FZDumpClasses(void) {
 
 -(bool)needsLocalNotification {
     return true;
+}
+
+%end
+
+%hook XMPPIQStanza
+
+-(NSString *)log {
+    NSString *r = %orig;
+    @try {
+        if (r && ([r rangeOfString:@"ns=md"].location != NSNotFound || [r rangeOfString:@"iq/error"].location != NSNotFound)) {
+            NSMutableString *out = [NSMutableString stringWithFormat:@"STANZA %@\n", FZMask(r)];
+            FZDumpElem((id<FZElem>)self, 1, out);
+            FZ(@"FckZck: %@", out);
+        }
+    } @catch (NSException *e) {}
+    return r;
+}
+
+%end
+
+%hook WADevicePairingSession
+
+- (void)devicePairingSession:(id)session didRequestPairDeviceWithRef:(id)ref authKey:(id)authKey identityKey:(id)identityKey hmacSignedDeviceIdentity:(id)hmac keyIndexList:(id)keyIndexList refCert:(id)refCert clientProps:(id)clientProps completion:(id)completion {
+    FZ(@"FckZck: PAIR request ref=%@ authKey=%@ identityKey=%@ hmacSignedDeviceIdentity=%@ keyIndexList=%@ refCert=%@ clientProps=%@",
+       FZDesc(ref), FZDesc(authKey), FZDesc(identityKey), FZDesc(hmac), FZDesc(keyIndexList), FZDesc(refCert), FZDesc(clientProps));
+    %orig;
+}
+
+- (void)handlePairDeviceResponseWithDeviceJID:(id)jid companionProps:(id)companionProps retryTimestamp:(unsigned long long)ts serverError:(id)serverError {
+    FZ(@"FckZck: PAIR response jid=%@ companionProps=%@ retryTimestamp=%llu serverError=%@",
+       FZDesc(jid), FZDesc(companionProps), ts, FZDesc(serverError));
+    %orig;
 }
 
 %end
