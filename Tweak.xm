@@ -2,11 +2,6 @@
 #include <substrate.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
-#include <mach-o/dyld.h>
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
-#include <malloc/malloc.h>
-#include <stdlib.h>
 
 // ---- Configurable version ----------------------------------------------
 // Read from /var/mobile/Library/Preferences/com.ifilipis.fckzck.plist
@@ -39,18 +34,23 @@ static BOOL gLidFallback = YES;
 // Experiment (1.13): if the bootstrap ("loading your chats") has not been told that the initial
 // history sync finished N seconds after pairing, tell it ourselves. 0 = off.
 // Config key: forceFinishBootstrapSeconds (integer).
-static int gForceFinishSeconds = 0; // 1.28.1: disabled; never force bootstrap completion.
+static int gForceFinishSeconds = 25; // 1.26: fallback, finish the bootstrap this many s after it starts (0 = off).
 // 1.19 test: make the companion service report initial history sync as finished.
+static BOOL gForceInitialSyncFinished = NO;  // 1.20 diagnostic / compatibility override.
+static BOOL gAutoFinishInitialBootstrap = YES; // 1.25: iOS 12 compatibility once INITIAL_BOOTSTRAP is actually received.
 static BOOL gInitialCalled = NO;
 static BOOL gSecCalled = NO;
 static __weak id gHistSvc = nil;
+static BOOL gForceScheduled = NO;
 static long long gBlockLogoutReason = 11;
+static id gBootObj = nil;               // 1.26: strong ref so it cannot vanish before we use it
+static BOOL gBootstrapSeen = NO;
+static BOOL gFinishRunning = NO;
+static int gFinishTries = 0;
 static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping did not fix the 400)
 // Experiment: OS version declared to the server in ClientPayload.UserAgent.
 // Config keys (strings): osVersion, osBuildNumber. An EMPTY osVersion disables
 // the override (the real iOS version is sent).
-static BOOL gReqFullSync = YES;   // 1.27: ask the phone for full history at pairing
-static int gHistDays = 365;       // 1.27: days of history requested
 static NSString *gOsVersion = nil;
 static NSString *gOsBuild = nil;
 
@@ -127,14 +127,10 @@ static void FZLoadConfig(void) {
     id bl = cfg[@"blockHistoryTimeoutLogout"];
     if ([bl respondsToSelector:@selector(boolValue)]) gBlockHistoryTimeoutLogout = [bl boolValue];
     gBlockLogoutReason = 11;
-    FZ(@"FckZck 1.28.1: blockHistoryTimeoutLogout=%d reason=%lld", gBlockHistoryTimeoutLogout, gBlockLogoutReason);
-    gForceFinishSeconds = 0;
-    FZ(@"FckZck 1.28.1: forceFinishBootstrapSeconds=0 (fixed off)");
-    id rf = cfg[@"requireFullSync"];
-    if ([rf respondsToSelector:@selector(boolValue)]) gReqFullSync = [rf boolValue];
-    id hd = cfg[@"historyDays"];
-    if ([hd isKindOfClass:[NSNumber class]]) gHistDays = [hd intValue];
-    FZ(@"FckZck 1.27: requireFullSync=%d historyDays=%d", gReqFullSync, gHistDays);
+    FZ(@"FckZck 1.26: blockHistoryTimeoutLogout=%d reason=%lld", gBlockHistoryTimeoutLogout, gBlockLogoutReason);
+    id ff = cfg[@"forceFinishBootstrapSeconds"];
+    if ([ff isKindOfClass:[NSNumber class]]) gForceFinishSeconds = [ff intValue];
+    FZ(@"FckZck: forceFinishBootstrapSeconds=%d", gForceFinishSeconds);
     id so = cfg[@"signalDeprecatedOverride"];
     if ([so isKindOfClass:[NSNumber class]]) gDeprecatedOverride = [so intValue];
     FZ(@"FckZck: signalDeprecatedOverride=%d", gDeprecatedOverride);
@@ -144,13 +140,16 @@ static void FZLoadConfig(void) {
     // Keep stock failure handling; the compatibility path is only activated
     // when runWhenInitialSyncFinished is actually reached.
     gHistoryMode = @"stock";
-    FZ(@"FckZck 1.28.1: historySyncFailureMode=%@ (fixed)", gHistoryMode);
+    FZ(@"FckZck 1.25: historySyncFailureMode=%@ (fixed)", gHistoryMode);
+    id fis = cfg[@"forceInitialSyncFinished"];
+    if ([fis respondsToSelector:@selector(boolValue)]) gForceInitialSyncFinished = [fis boolValue];
+    FZ(@"FckZck: forceInitialSyncFinished=%d", gForceInitialSyncFinished);
     id fs = cfg[@"forceSyncState"];
     if ([fs isKindOfClass:[NSNumber class]]) { gForceSyncState = fs; FZ(@"FckZck: forceSyncState=%@", fs); } else { FZ(@"FckZck: forceSyncState default=%@", gForceSyncState); }
     // Never consume legacy osVersion/osBuildNumber plist overrides.
     gOsVersion = nil;
     gOsBuild = nil;
-    FZ(@"FckZck 1.28.1: osVersion override=(off) osBuildNumber override=(off) (fixed)");
+    FZ(@"FckZck 1.25: osVersion override=(off) osBuildNumber override=(off) (fixed)");
     if ([v isKindOfClass:[NSString class]] && v.length) wanted = v;
     else FZ(@"FckZck: no config found, using default version");
 
@@ -345,11 +344,6 @@ static void new_setOsBuildNumber(id self, SEL _cmd, id v) {
 static void (*orig_setDevice)(id, SEL, id);
 static void new_setDevice(id self, SEL _cmd, id v) {
     FZ(@"FckZck: UserAgent.setDevice(%@)", v);
-    static int stackN = 0;
-    if (stackN++ < 3) {
-        NSArray *st = [NSThread callStackSymbols];
-        for (NSUInteger i = 0; i < st.count && i < 30; i++) FZ(@"FckZck 1.27: STACK#%d %@", stackN, st[i]);
-    }
     orig_setDevice(self, _cmd, v);
 }
 
@@ -403,6 +397,7 @@ static BOOL FZInstallUserAgentHooks(void) {
 //   "continue" (default) - on failure behave as if the initial sync finished
 //   "ignore"             - on failure do nothing (loading screen may stay)
 //   "stock"              - original behaviour (logout)
+static void FZFinishBootstrap(const char *why);
 static void (*orig_hsInitial)(id, SEL);
 static void new_hsInitial(id self, SEL _cmd) {
     FZ(@"FckZck: CompanionBootstrapLoading.handleInitialHistorySync called");
@@ -442,9 +437,26 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
         }
         FZ(@"%@", line);
     } @catch (NSException *e) {}
-    // 1.28.1: observe the notification only; never force bootstrap completion here.
+    // 1.26: decide BEFORE the original runs (it consumes the notification, which is why the
+    // 1.25 check after the call never matched). hasInitialHistBootstrapInlinePayload is a
+    // plain NSNumber, the same key the log line above already prints successfully.
+    BOOL isBootstrapInline = NO;
+    @try {
+        id st  = [msg valueForKeyPath:@"historySyncNotification.syncType"];
+        id has = [msg valueForKeyPath:@"historySyncNotification.hasInitialHistBootstrapInlinePayload"];
+        isBootstrapInline = [st respondsToSelector:@selector(integerValue)] && [st integerValue] == 0 &&
+                            [has respondsToSelector:@selector(boolValue)] && [has boolValue];
+    } @catch (NSException *e) { isBootstrapInline = NO; }
     orig_hsHandle(self, _cmd, msg, stanza);
 
+    if (gAutoFinishInitialBootstrap && isBootstrapInline && !gBootstrapSeen) {
+        gBootstrapSeen = YES;
+        gForceInitialSyncFinished = YES;
+        FZ(@"FckZck 1.26: INITIAL_BOOTSTRAP received; completing the bootstrap in 6 s");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            FZFinishBootstrap("INITIAL_BOOTSTRAP received");
+        });
+    }
 }
 
 static void (*orig_preKeyFail)(id, SEL, id);
@@ -573,14 +585,34 @@ static BOOL new_isInit(id self, SEL _cmd) {
     BOOL r = orig_isInit(self, _cmd);
     static int last = -1;
     if (last != (int)r) { last = (int)r; FZ(@"FckZck: HistorySyncCompanionService.isInitialSyncFinished -> %d", r); }
+    if (gForceInitialSyncFinished) {
+        FZ(@"FckZck: forcing isInitialSyncFinished -> YES");
+        return YES;
+    }
     return r;
 }
 static void (*orig_runWhen)(id, SEL, id);
 static void new_runWhen(id self, SEL _cmd, id blk) {
-    BOOL realFinished = NO;
-    @try { realFinished = orig_isInit ? orig_isInit(self, sel_registerName("isInitialSyncFinished")) : NO; } @catch (NSException *e) {}
-    FZ(@"FckZck 1.28.1: runWhenInitialSyncFinished called block=%@ realState=%d", blk ? @"yes" : @"nil", realFinished);
-    // Preserve WhatsApp's original continuation semantics. Never execute it early.
+    FZ(@"FckZck: HistorySyncCompanionService.runWhenInitialSyncFinished: called (block=%@)", blk ? @"yes" : @"nil");
+    if (blk) {
+        BOOL realFinished = NO;
+        @try { realFinished = orig_isInit ? orig_isInit(self, sel_registerName("isInitialSyncFinished")) : NO; } @catch (NSException *e) {}
+        if (!realFinished) {
+            // This is the exact deadlock observed on iOS 12: the continuation is
+            // registered, but the Swift HistorySyncDevice never flips the state.
+            gForceInitialSyncFinished = YES;
+            FZ(@"FckZck 1.25: runWhenInitialSyncFinished while state=0; executing continuation directly");
+            @try {
+                void (^continuation)(void) = (void (^)(void))blk;
+                continuation();
+                FZ(@"FckZck 1.25: initial-sync continuation executed");
+            } @catch (NSException *e) {
+                FZ(@"FckZck 1.25: continuation exception=%@; falling back to original", e);
+                orig_runWhen(self, _cmd, blk);
+            }
+            return;
+        }
+    }
     orig_runWhen(self, _cmd, blk);
 }
 static void (*orig_didUpdAB)(id, SEL);
@@ -594,7 +626,9 @@ static void new_resumeBg(id self, SEL _cmd) {
     orig_resumeBg(self, _cmd);
 }
 
-// Observe the bootstrap critical block without changing WhatsApp state.
+// CompanionBootstrapLoading waits for several steps. Log 6 showed criticalBlock, criticalUnblockLow
+// and (forced) initialSync, but never handleSecurityNotificationSetting -- the primary normally
+// delivers that through history sync, which never gets processed here.
 static void (*orig_hsSec)(id, SEL);
 static void new_hsSec(id self, SEL _cmd) {
     FZ(@"FckZck: CompanionBootstrapLoading.handleSecurityNotificationSetting called");
@@ -602,12 +636,58 @@ static void new_hsSec(id self, SEL _cmd) {
     orig_hsSec(self, _cmd);
 }
 
-static void (*orig_critBlock)(id, SEL, id);
-static void new_critBlock(id self, SEL _cmd, id arg) {
-    FZ(@"FckZck 1.28.1: bootstrap critical block entered");
-    orig_critBlock(self, _cmd, arg);
+// 1.26: complete the companion bootstrap by hand. The log shows that on iOS 12 the Swift
+// history-sync code receives INITIAL_BOOTSTRAP but never calls handleInitialHistorySync or
+// handleSecurityNotificationSetting on the bootstrap object, so after 120 s the app removes its
+// own companion device (history_sync_timeout). We call those two steps ourselves.
+static void FZFinishBootstrap(const char *why) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gInitialCalled && gSecCalled) { FZ(@"FckZck 1.26: finish(%s): nothing to do, steps already reported", why); return; }
+        id boot = gBootObj;
+        if (!boot || !orig_hsInitial) {
+            if (gFinishTries++ < 30) {
+                FZ(@"FckZck 1.26: finish(%s): no bootstrap object yet, retry in 2 s (%d)", why, gFinishTries);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    FZFinishBootstrap(why);
+                });
+            } else FZ(@"FckZck 1.26: finish(%s): gave up, no bootstrap object", why);
+            return;
+        }
+        if (gFinishRunning) return;
+        gFinishRunning = YES;
+        FZ(@"FckZck 1.26: finish(%s): initialCalled=%d secCalled=%d", why, gInitialCalled, gSecCalled);
+        @try {
+            if (!gInitialCalled) {
+                gInitialCalled = YES;
+                FZ(@"FckZck 1.26: calling handleInitialHistorySync");
+                orig_hsInitial(boot, sel_registerName("handleInitialHistorySync"));
+            }
+        } @catch (NSException *e) { FZ(@"FckZck 1.26: handleInitialHistorySync exception=%@", e); }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            @try {
+                if (!gSecCalled && orig_hsSec) {
+                    gSecCalled = YES;
+                    FZ(@"FckZck 1.26: calling handleSecurityNotificationSetting");
+                    orig_hsSec(boot, sel_registerName("handleSecurityNotificationSetting"));
+                }
+            } @catch (NSException *e) { FZ(@"FckZck 1.26: handleSecurityNotificationSetting exception=%@", e); }
+            gFinishRunning = NO;
+        });
+    });
 }
 
+static void (*orig_critBlock)(id, SEL, id);
+static void new_critBlock(id self, SEL _cmd, id arg) {
+    gBootObj = self;
+    if (gForceFinishSeconds > 0 && !gForceScheduled) {
+        gForceScheduled = YES;
+        FZ(@"FckZck: bootstrap object captured, will finish it in %d s if still loading", gForceFinishSeconds);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)gForceFinishSeconds * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            FZFinishBootstrap("fallback timer");
+        });
+    }
+    orig_critBlock(self, _cmd, arg);
+}
 
 // WAAccountCleaner logout entry points. The timeout path in log 2 went through
 // logoutAuthenticatedCompanionWithReason (".../normal/11").
@@ -615,7 +695,8 @@ static void (*orig_logoutAuth)(id, SEL, long long, BOOL, id);
 static void new_logoutAuth(id self, SEL _cmd, long long reason, BOOL restart, id ctx) {
     FZ(@"FckZck: WAAccountCleaner.logoutAuthenticatedCompanion reason=%lld restart=%d", reason, restart);
     if (gBlockHistoryTimeoutLogout && reason == gBlockLogoutReason) {
-        FZ(@"FckZck 1.28.1: -> history_sync_timeout logout blocked (no forced completion)");
+        FZ(@"FckZck 1.26: -> history_sync_timeout logout blocked, finishing the bootstrap instead");
+        FZFinishBootstrap("timeout logout blocked");
         return;
     }
     orig_logoutAuth(self, _cmd, reason, restart, ctx);
@@ -849,475 +930,9 @@ static BOOL FZInstallSignalHooks(void) {
 }
 // -------------------------------------------------------------------------
 
-// ---- 1.28.1: DeviceProps (what the companion tells the PRIMARY PHONE) -------
-// Log 2: classes WAPBDeviceProps* do not exist, and no pair-device stanza is used. So we find, at
-// runtime, every class with a setter taking the DeviceProps bytes (setDeviceProps: etc.), and
-// rewrite those bytes as raw protobuf: spoofed app version (field 2), requireFullSync (4) and a
-// historySyncConfig (5). No class names needed. Unlink + link again after installing.
-static BOOL FZPBVarint(const uint8_t *b, NSUInteger n, NSUInteger *i, uint64_t *out) {
-    uint64_t v = 0; int sh = 0;
-    while (*i < n && sh < 64) { uint8_t c = b[(*i)++]; v |= (uint64_t)(c & 0x7f) << sh; if (!(c & 0x80)) { *out = v; return YES; } sh += 7; }
-    return NO;
-}
-static void FZPBPut(NSMutableData *d, uint64_t v) {
-    do { uint8_t c = v & 0x7f; v >>= 7; if (v) c |= 0x80; [d appendBytes:&c length:1]; } while (v);
-}
-// fields: array of @{f, w, v(NSNumber|NSData)}
-static NSMutableArray *FZPBParse(NSData *d) {
-    NSMutableArray *out = [NSMutableArray array];
-    const uint8_t *b = (const uint8_t *)d.bytes; NSUInteger n = d.length, i = 0;
-    while (i < n) {
-        uint64_t tag, v;
-        if (!FZPBVarint(b, n, &i, &tag)) return nil;
-        int w = tag & 7; uint64_t f = tag >> 3;
-        if (f == 0) return nil;
-        if (w == 0) { if (!FZPBVarint(b, n, &i, &v)) return nil; [out addObject:@{@"f":@(f), @"w":@0, @"v":@(v)}]; }
-        else if (w == 2) { if (!FZPBVarint(b, n, &i, &v) || v > n - i) return nil; [out addObject:@{@"f":@(f), @"w":@2, @"v":[d subdataWithRange:NSMakeRange(i, (NSUInteger)v)]}]; i += (NSUInteger)v; }
-        else if (w == 1) { if (n - i < 8) return nil; [out addObject:@{@"f":@(f), @"w":@1, @"v":[d subdataWithRange:NSMakeRange(i, 8)]}]; i += 8; }
-        else if (w == 5) { if (n - i < 4) return nil; [out addObject:@{@"f":@(f), @"w":@5, @"v":[d subdataWithRange:NSMakeRange(i, 4)]}]; i += 4; }
-        else return nil;
-    }
-    return out;
-}
-static NSData *FZPBSerialize(NSArray *fields) {
-    NSMutableData *o = [NSMutableData data];
-    for (NSDictionary *e in fields) {
-        int w = [e[@"w"] intValue];
-        FZPBPut(o, ([e[@"f"] unsignedLongLongValue] << 3) | w);
-        if (w == 0) FZPBPut(o, [e[@"v"] unsignedLongLongValue]);
-        else if (w == 2) { NSData *x = e[@"v"]; FZPBPut(o, x.length); [o appendData:x]; }
-        else [o appendData:e[@"v"]];
-    }
-    return o;
-}
-static NSData *FZPBGet(NSArray *fields, uint64_t f) {
-    for (NSDictionary *e in fields) if ([e[@"f"] unsignedLongLongValue] == f && [e[@"w"] intValue] == 2) return e[@"v"];
-    return nil;
-}
-static void FZPBSet(NSMutableArray *fields, uint64_t f, int w, id v) {
-    for (NSUInteger k = 0; k < fields.count; k++) if ([fields[k][@"f"] unsignedLongLongValue] == f) { [fields removeObjectAtIndex:k]; k--; }
-    [fields addObject:@{@"f":@(f), @"w":@(w), @"v":v}];
-}
-static NSData *FZTuneDevicePropsData(NSData *in) {
-    @try {
-        NSMutableArray *f = FZPBParse(in);
-        if (!f || !f.count || (!FZPBGet(f, 2) && !FZPBGet(f, 1))) { FZ(@"FckZck 1.27: bytes (%lu) do not look like DeviceProps, untouched", (unsigned long)in.length); return in; }
-        NSMutableArray *ver = FZPBGet(f, 2) ? FZPBParse(FZPBGet(f, 2)) : [NSMutableArray array];
-        if (!ver) ver = [NSMutableArray array];
-        for (int i = 0; i < 4; i++) FZPBSet(ver, i + 1, 0, @(gNum[i]));
-        FZPBSet(f, 2, 2, FZPBSerialize(ver));
-        FZPBSet(f, 4, 0, @(gReqFullSync ? 1 : 0));
-        NSMutableArray *cfg = FZPBGet(f, 5) ? FZPBParse(FZPBGet(f, 5)) : [NSMutableArray array];
-        if (!cfg) cfg = [NSMutableArray array];
-        FZPBSet(cfg, 1, 0, @(gHistDays));     // fullSyncDaysLimit
-        FZPBSet(cfg, 2, 0, @(1024));          // fullSyncSizeMbLimit
-        FZPBSet(cfg, 3, 0, @(10240));         // storageQuotaMb
-        FZPBSet(cfg, 5, 0, @(gHistDays));     // recentSyncDaysLimit
-        FZPBSet(f, 5, 2, FZPBSerialize(cfg));
-        NSData *out = FZPBSerialize(f);
-        static int hexN = 0;
-        if (hexN++ < 3) {
-            NSMutableString *h1 = [NSMutableString string], *h2 = [NSMutableString string];
-            for (NSUInteger i = 0; i < in.length && i < 96; i++) [h1 appendFormat:@"%02x", ((const uint8_t *)in.bytes)[i]];
-            for (NSUInteger i = 0; i < out.length && i < 96; i++) [h2 appendFormat:@"%02x", ((const uint8_t *)out.bytes)[i]];
-            FZ(@"FckZck 1.27: DeviceProps hex in=%@ out=%@", h1, h2);
-        }
-        FZ(@"FckZck 1.27: DeviceProps rewritten %lu -> %lu bytes (version %@, fullSync=%d, days=%d)", (unsigned long)in.length, (unsigned long)out.length, gVersion, gReqFullSync, gHistDays);
-        return out;
-    } @catch (NSException *e) { FZ(@"FckZck 1.27: DeviceProps rewrite exception %@", e); return in; }
-}
-
-static void FZHookPropsSetter(Class c, SEL sel) {
-    __block IMP orig = NULL;
-    IMP repl = imp_implementationWithBlock(^(id self, id v) {
-        id nv = v;
-        if ([v isKindOfClass:[NSData class]]) nv = FZTuneDevicePropsData((NSData *)v);
-        else FZ(@"FckZck 1.27: %s %s got %@ (not NSData), untouched", class_getName([self class]), sel_getName(sel), v ? NSStringFromClass([v class]) : @"nil");
-        ((void (*)(id, SEL, id))orig)(self, sel, nv);
-    });
-    MSHookMessageEx(c, sel, repl, &orig);
-    FZ(@"FckZck 1.27: hooked %s %s", class_getName(c), sel_getName(sel));
-}
-
-// ---- 1.27.2: hook the CompanionProps model classes themselves ---------------
-// Log 3: setCompanionProps: on the RegData/DeviceInfo classes never fired (props are not set
-// through them while pairing). The classes WAPBCompanionProps / _AppVersion / _HistorySyncConfig
-// do exist, so we hook their setters and getters too.
-static BOOL FZHookB(Class c, const char *sel, const char *types, IMP (^mk)(IMP *slot, SEL s)) {
-    SEL s = sel_registerName(sel);
-    Method m = class_getInstanceMethod(c, s);
-    if (!m) { FZ(@"FckZck 1.27: %s has no %s", class_getName(c), sel); return NO; }
-    const char *e = method_getTypeEncoding(m);
-    const char *p = e ? strstr(e, "@0:8") : NULL;
-    if (!p || (types[0] && (!p[4] || !strchr(types, p[4])))) { FZ(@"FckZck 1.27: %s %s unexpected type %s", class_getName(c), sel, e ? e : "?"); return NO; }
-    IMP *slot = (IMP *)calloc(1, sizeof(IMP));
-    MSHookMessageEx(c, s, mk(slot, s), slot);
-    FZ(@"FckZck 1.27: hooked %s %s (%s)", class_getName(c), sel, e);
-    return YES;
-}
-static void FZSetKV(id o, NSString *k, id v) {
-    @try { [o setValue:v forKey:k]; FZ(@"FckZck 1.27: %@=%@ (now %@)", k, v, [o valueForKey:k]); }
-    @catch (NSException *e) { FZ(@"FckZck 1.27: cannot set %@: %@", k, e.reason); }
-}
-static void FZTuneProps(id p) {
-    static BOOL busy = NO;
-    if (busy || !p) return;
-    busy = YES;
-    @try {
-        id cfg = nil;
-        @try { cfg = [p valueForKey:@"historySyncConfig"]; } @catch (NSException *e) { cfg = nil; }
-        Class cc = objc_getClass("WAPBCompanionProps_HistorySyncConfig");
-        if (!cfg && cc) { cfg = [[cc alloc] init]; FZSetKV(p, @"historySyncConfig", cfg); }
-        FZSetKV(p, @"requireFullSync", @(gReqFullSync));
-        if (cfg) {
-            FZSetKV(cfg, @"fullSyncDaysLimit", @(gHistDays));
-            FZSetKV(cfg, @"recentSyncDaysLimit", @(gHistDays));
-            FZSetKV(cfg, @"fullSyncSizeMbLimit", @(1024));
-            FZSetKV(cfg, @"storageQuotaMb", @(10240));
-        } else FZ(@"FckZck 1.27: no historySyncConfig object");
-    } @catch (NSException *e) { FZ(@"FckZck 1.27: tune exception %@", e); }
-    busy = NO;
-}
-static void FZListSel(const char *cn) {
-    Class c = objc_getClass(cn);
-    if (!c) return;
-    unsigned int n = 0; Method *ms = class_copyMethodList(c, &n);
-    NSMutableArray *a = [NSMutableArray array];
-    for (unsigned int i = 0; i < n; i++) { const char *x = sel_getName(method_getName(ms[i])); if (x[0] != '.') [a addObject:@(x)]; }
-    free(ms);
-    FZ(@"FckZck 1.27: methods of %s: %@", cn, [a componentsJoinedByString:@" "]);
-}
-static BOOL gCompHooked = NO;
-static void FZInstallCompanionHooks(void) {
-    if (gCompHooked) return;
-    Class av = objc_getClass("WAPBCompanionProps_AppVersion");
-    Class cp = objc_getClass("WAPBCompanionProps");
-    if (!av || !cp) return;
-    gCompHooked = YES;
-    FZListSel("WAPBCompanionProps"); FZListSel("WAPBCompanionProps_HistorySyncConfig");
-    FZListSel("WAPBClientPayload_CompanionRegData"); FZListSel("WAPBCompanionDeviceInfo");
-    const char *names[] = {"setPrimary:", "setSecondary:", "setTertiary:", "setQuaternary:"};
-    for (int i = 0; i < 4; i++) {
-        int idx = i;
-        FZHookB(av, names[i], "Ii", ^IMP(IMP *slot, SEL s) {
-            return imp_implementationWithBlock(^(id self, unsigned int v) {
-                ((void (*)(id, SEL, unsigned int))*slot)(self, s, (unsigned int)gNum[idx]);
-            });
-        });
-    }
-    FZHookB(cp, "setRequireFullSync:", "B", ^IMP(IMP *slot, SEL s) {
-        return imp_implementationWithBlock(^(id self, BOOL v) {
-            ((void (*)(id, SEL, BOOL))*slot)(self, s, (BOOL)gReqFullSync);
-        });
-    });
-    FZHookB(cp, "setPlatformType:", "Ii", ^IMP(IMP *slot, SEL s) {
-        return imp_implementationWithBlock(^(id self, unsigned int v) {
-            ((void (*)(id, SEL, unsigned int))*slot)(self, s, v);
-            FZ(@"FckZck 1.27: CompanionProps.setPlatformType(%u)", v);
-            FZTuneProps(self);
-        });
-    });
-    FZHookB(cp, "setHistorySyncConfig:", "@", ^IMP(IMP *slot, SEL s) {
-        return imp_implementationWithBlock(^(id self, id v) {
-            ((void (*)(id, SEL, id))*slot)(self, s, v);
-            FZTuneProps(self);
-        });
-    });
-    FZHookB(cp, "setVersion:", "@", ^IMP(IMP *slot, SEL s) {
-        return imp_implementationWithBlock(^(id self, id v) {
-            ((void (*)(id, SEL, id))*slot)(self, s, v);
-            FZTuneProps(self);
-        });
-    });
-    // Getter fallback: whoever reads the NSData gets the rewritten bytes.
-    const char *cls[] = {"WAPBClientPayload_CompanionRegData", "WAPBCompanionDeviceInfo"};
-    for (int i = 0; i < 2; i++) {
-        Class c = objc_getClass(cls[i]);
-        if (!c) continue;
-        FZHookB(c, "companionProps", "", ^IMP(IMP *slot, SEL s) {
-            return imp_implementationWithBlock(^id(id self) {
-                id r = ((id (*)(id, SEL))*slot)(self, s);
-                FZ(@"FckZck 1.27: %s.companionProps read (%@)", class_getName([self class]), r ? NSStringFromClass([r class]) : @"nil");
-                if ([r isKindOfClass:[NSData class]]) return FZTuneDevicePropsData((NSData *)r);
-                return r;
-            });
-        });
-    }
-}
-
-// ---- 1.27.3: rewrite the CompanionProps bytes inside the ClientPayload right before it is
-// serialized (they are not built through setters in this run: persisted/parsed instead).
-static NSString *gRegKey = nil;
-static void FZTunePayload(id payload) {
-    @try {
-        if (!gRegKey) return;
-        id reg = [payload valueForKey:gRegKey];
-        if (!reg) return;
-        id p = [reg valueForKey:@"companionProps"];
-        if (![p isKindOfClass:[NSData class]] || ![(NSData *)p length]) { FZ(@"FckZck 1.27: payload companionProps empty/not data (%@)", p ? NSStringFromClass([p class]) : @"nil"); return; }
-        NSData *n = FZTuneDevicePropsData((NSData *)p);
-        if (![n isEqualToData:(NSData *)p]) { [reg setValue:n forKey:@"companionProps"]; FZ(@"FckZck 1.27: payload companionProps replaced"); }
-    } @catch (NSException *e) { FZ(@"FckZck 1.27: payload tune exception %@", e); }
-}
-static BOOL gPayloadHooked = NO;
-static void FZInstallPayloadHook(void) {
-    if (gPayloadHooked) return;
-    Class pc = objc_getClass("WAPBClientPayload");
-    Class rc = objc_getClass("WAPBClientPayload_CompanionRegData");
-    if (!pc || !rc) return;
-    gPayloadHooked = YES;
-    unsigned int n = 0;
-    objc_property_t *ps = class_copyPropertyList(pc, &n);
-    NSMutableArray *names = [NSMutableArray array];
-    for (unsigned int i = 0; i < n; i++) {
-        const char *nm = property_getName(ps[i]);
-        const char *at = property_getAttributes(ps[i]);
-        if (nm) [names addObject:@(nm)];
-        if (nm && at && strstr(at, "WAPBClientPayload_CompanionRegData")) gRegKey = @(nm);
-    }
-    free(ps);
-    FZ(@"FckZck 1.27: ClientPayload props: %@ | regData key=%@", [names componentsJoinedByString:@" "], gRegKey);
-    FZHookB(pc, "data", "", ^IMP(IMP *slot, SEL s) {
-        return imp_implementationWithBlock(^id(id self) {
-            FZ(@"FckZck 1.27: ClientPayload.data called");
-            FZTunePayload(self);
-            return ((id (*)(id, SEL))*slot)(self, s);
-        });
-    });
-}
-
-// ---- 1.27.4: trace + early rewrite at the GPBMessage serialization entry points ------
-// Log 5: ClientPayload.data / companionProps setters/getters never fired while registering
-// ("register_as_companion_phone"), so the payload is serialized through another GPB path.
-// Hook the base GPBMessage methods; trace WAPBClientPayload*/WAPBCompanion* and rewrite the
-// props in serializedSize (the first call of every serialization path).
-static int gTraceN = 0;
-static BOOL FZTraced(id self, BOOL *isPayload) {
-    const char *cn = object_getClassName(self);
-    if (!cn) return NO;
-    *isPayload = (strcmp(cn, "WAPBClientPayload") == 0);
-    return *isPayload || strncmp(cn, "WAPBClientPayload_", 18) == 0 || strncmp(cn, "WAPBCompanion", 13) == 0;
-}
-static BOOL gTraceHooked = NO;
-static void FZInstallTraceHooks(void) {
-    if (gTraceHooked) return;
-    Class g = objc_getClass("GPBMessage");
-    if (!g) return;
-    gTraceHooked = YES;
-    FZHookB(g, "serializedSize", "", ^IMP(IMP *slot, SEL s) {
-        return imp_implementationWithBlock(^unsigned long(id self) {
-            BOOL pl = NO;
-            if (FZTraced(self, &pl)) {
-                if (gTraceN++ < 60) FZ(@"FckZck 1.27: trace serializedSize %s", object_getClassName(self));
-                if (pl) FZTunePayload(self);
-            }
-            return ((unsigned long (*)(id, SEL))*slot)(self, s);
-        });
-    });
-    FZHookB(g, "data", "", ^IMP(IMP *slot, SEL s) {
-        return imp_implementationWithBlock(^id(id self) {
-            BOOL pl = NO;
-            if (FZTraced(self, &pl) && gTraceN++ < 60) FZ(@"FckZck 1.27: trace data %s", object_getClassName(self));
-            return ((id (*)(id, SEL))*slot)(self, s);
-        });
-    });
-    FZHookB(g, "writeToCodedOutputStream:", "@", ^IMP(IMP *slot, SEL s) {
-        return imp_implementationWithBlock(^(id self, id st) {
-            BOOL pl = NO;
-            if (FZTraced(self, &pl) && gTraceN++ < 60) FZ(@"FckZck 1.27: trace writeToCodedOutputStream %s", object_getClassName(self));
-            ((void (*)(id, SEL, id))*slot)(self, s, st);
-        });
-    });
-    FZHookB(g, "writeToOutputStream:", "@", ^IMP(IMP *slot, SEL s) {
-        return imp_implementationWithBlock(^(id self, id st) {
-            BOOL pl = NO;
-            if (FZTraced(self, &pl)) {
-                if (gTraceN++ < 60) FZ(@"FckZck 1.27: trace writeToOutputStream %s", object_getClassName(self));
-                if (pl) FZTunePayload(self);
-            }
-            ((void (*)(id, SEL, id))*slot)(self, s, st);
-        });
-    });
-    FZHookB(g, "delimitedData", "", ^IMP(IMP *slot, SEL s) {
-        return imp_implementationWithBlock(^id(id self) {
-            BOOL pl = NO;
-            if (FZTraced(self, &pl) && gTraceN++ < 60) FZ(@"FckZck 1.27: trace delimitedData %s", object_getClassName(self));
-            return ((id (*)(id, SEL))*slot)(self, s);
-        });
-    });
-}
-
-// ---- 1.28: hook the exported SharedModules payload builder (WACreateClientPayload) ------
-// Log 6 stack: the ClientPayload is built by the C function WACreateClientPayload in SharedModules
-// (called from _WCCConnectionDefaultDoConnectWithAuthKeys), not through GPBMessage serialization.
-// We hook it by name; the return value is validated before touching it. If it is serialized
-// ClientPayload bytes (NSData), field 19 (devicePairingData) -> field 8 (companionProps / DeviceProps)
-// is rewritten with the spoofed version + full-history request.
-static int FZCmpU(const void *a, const void *b) { uintptr_t x = *(const uintptr_t *)a, y = *(const uintptr_t *)b; return x < y ? -1 : (x > y); }
-static BOOL FZIsObjC(void *r) {
-    uintptr_t v = (uintptr_t)r;
-    if (v < 0x100000000ULL || (v & 7) || (v >> 40)) return NO;
-    if (malloc_size(r) < 16) return NO;
-    uintptr_t cls = (*(uintptr_t *)r) & 0x0000000ffffffff8ULL;
-    unsigned int n = 0;
-    Class *cl = objc_copyClassList(&n);
-    uintptr_t *arr = (uintptr_t *)malloc(sizeof(uintptr_t) * (n ? n : 1));
-    for (unsigned int i = 0; i < n; i++) arr[i] = (uintptr_t)cl[i];
-    free(cl);
-    qsort(arr, n, sizeof(uintptr_t), FZCmpU);
-    BOOL ok = bsearch(&cls, arr, n, sizeof(uintptr_t), FZCmpU) != NULL;
-    free(arr);
-    return ok;
-}
-
-static NSData *FZTuneClientPayloadBytes(NSData *in) {
-    @try {
-        NSMutableArray *f = FZPBParse(in);
-        if (!f) { FZ(@"FckZck 1.28: payload bytes (%lu) are not protobuf, untouched", (unsigned long)in.length); return in; }
-        NSData *reg = FZPBGet(f, 19);
-        FZ(@"FckZck 1.28: ClientPayload %lu bytes, %lu fields, devicePairingData(19) %@", (unsigned long)in.length, (unsigned long)f.count, reg ? @"present" : @"absent");
-        if (!reg) return in;
-        NSMutableArray *sub = FZPBParse(reg);
-        if (!sub) return in;
-        uint64_t fid = 8;
-        NSData *props = FZPBGet(sub, 8);
-        if (!props) {
-            for (NSDictionary *e in sub) {   // fallback: any length-delimited field that parses like DeviceProps
-                if ([e[@"w"] intValue] != 2) continue;
-                NSMutableArray *t = FZPBParse(e[@"v"]);
-                if (t && FZPBGet(t, 2) && FZPBGet(t, 1)) { props = e[@"v"]; fid = [e[@"f"] unsignedLongLongValue]; break; }
-            }
-        }
-        if (!props) { FZ(@"FckZck 1.28: no companionProps inside devicePairingData"); return in; }
-        NSData *np = FZTuneDevicePropsData(props);
-        if ([np isEqualToData:props]) return in;
-        FZPBSet(sub, fid, 2, np);
-        FZPBSet(f, 19, 2, FZPBSerialize(sub));
-        NSData *out = FZPBSerialize(f);
-        FZ(@"FckZck 1.28: ClientPayload rewritten %lu -> %lu bytes", (unsigned long)in.length, (unsigned long)out.length);
-        return out;
-    } @catch (NSException *e) { FZ(@"FckZck 1.28: payload rewrite exception %@", e); return in; }
-}
-
-static void *FZHandlePayloadResult(void *r, const char *tag) {
-    if (!FZIsObjC(r)) { FZ(@"FckZck 1.28: %s returned %p (not an ObjC object), untouched", tag, r); return r; }
-    id o = (__bridge id)r;
-    FZ(@"FckZck 1.28: %s returned %s", tag, object_getClassName(o));
-    @try {
-        if ([o isKindOfClass:[NSData class]]) {
-            NSData *d = (NSData *)o;
-            NSData *n = FZTuneClientPayloadBytes(d);
-            if (n && ![n isEqualToData:d]) {
-                if ([o isKindOfClass:[NSMutableData class]]) { [(NSMutableData *)o setData:n]; FZ(@"FckZck 1.28: payload patched in place"); }
-                else { FZ(@"FckZck 1.28: payload replaced"); return (void *)CFBridgingRetain([NSData dataWithData:n]); }  // original leaked on purpose (ownership unknown)
-            }
-        } else if ([o isKindOfClass:objc_getClass("WAPBClientPayload")]) {
-            FZTunePayload(o);
-        }
-    } @catch (NSException *e) { FZ(@"FckZck 1.28: handle exception %@", e); }
-    return r;
-}
-
-typedef void *(*FZFn8)(void *, void *, void *, void *, void *, void *, void *, void *);
-#define FZ_PAYFN(N) \
-static FZFn8 orig_pf##N; \
-static void *new_pf##N(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) { \
-    void *r = orig_pf##N(a, b, c, d, e, f, g, h); \
-    return FZHandlePayloadResult(r, "payloadFn" #N); }
-FZ_PAYFN(0) FZ_PAYFN(1) FZ_PAYFN(2)
-
-static NSArray *FZSymbols(const struct mach_header_64 *mh) {
-    intptr_t slide = 0;
-    for (uint32_t i = 0; i < _dyld_image_count(); i++)
-        if ((const void *)_dyld_get_image_header(i) == (const void *)mh) { slide = _dyld_get_image_vmaddr_slide(i); break; }
-    const uint8_t *p = (const uint8_t *)(mh + 1);
-    struct symtab_command *st = NULL; struct segment_command_64 *le = NULL;
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
-        struct load_command *lc = (struct load_command *)p;
-        if (lc->cmd == LC_SYMTAB) st = (struct symtab_command *)lc;
-        else if (lc->cmd == LC_SEGMENT_64) { struct segment_command_64 *sc = (struct segment_command_64 *)lc; if (strcmp(sc->segname, "__LINKEDIT") == 0) le = sc; }
-        p += lc->cmdsize;
-    }
-    NSMutableArray *out = [NSMutableArray array];
-    if (!st || !le) return out;
-    uintptr_t base = (uintptr_t)le->vmaddr + slide - le->fileoff;
-    struct nlist_64 *nl = (struct nlist_64 *)(base + st->symoff);
-    const char *str = (const char *)(base + st->stroff);
-    for (uint32_t i = 0; i < st->nsyms; i++) {
-        if ((nl[i].n_type & N_TYPE) != N_SECT) continue;
-        const char *nm = str + nl[i].n_un.n_strx;
-        if (nm[0]) [out addObject:@(nm)];
-    }
-    return out;
-}
-
-static void FZInstallPayloadFnHooks(MSImageRef image) {
-    NSArray *syms = FZSymbols((const struct mach_header_64 *)image);
-    FZ(@"FckZck 1.28: SharedModules exports %lu symbols", (unsigned long)syms.count);
-    NSMutableArray *cand = [NSMutableArray array];
-    int logged = 0;
-    for (NSString *n in syms) {
-        NSString *l = [n lowercaseString];
-        if (logged < 120 && ([l containsString:@"payload"] || [l containsString:@"companion"] || [l containsString:@"deviceprops"] || [l containsString:@"regdata"] || [l containsString:@"noise"] || [l containsString:@"handshake"])) { FZ(@"FckZck 1.28: sym %@", n); logged++; }
-        if ([n hasPrefix:@"_WACreate"] && [l containsString:@"payload"] && ![cand containsObject:n]) [cand addObject:n];
-    }
-    int k = 0;
-    for (NSString *n in cand) {
-        if (k >= 3) break;
-        const char *c = [n UTF8String];
-        void *sym = MSFindSymbol(image, c);
-        if (!sym) continue;
-        if (k == 0) MSHookFunction(sym, (void *)new_pf0, (void **)&orig_pf0);
-        else if (k == 1) MSHookFunction(sym, (void *)new_pf1, (void **)&orig_pf1);
-        else MSHookFunction(sym, (void *)new_pf2, (void **)&orig_pf2);
-        FZ(@"FckZck 1.28: hooked payload builder %s as payloadFn%d", c, k);
-        k++;
-    }
-    if (!k) FZ(@"FckZck 1.28: no WACreate*Payload* export found");
-}
-
-static int gPropsHooks = 0;
-static NSMutableSet *gPropsSeen;
-static void FZScanDeviceProps(void) {
-    if (!gPropsSeen) gPropsSeen = [NSMutableSet set];
-    const char *sels[] = {"setDeviceProps:", "setCompanionProps:", "setDevicePropsData:", "setClientProps:"};
-    unsigned int n = 0;
-    Class *cl = objc_copyClassList(&n);
-    int logged = 0;
-    for (unsigned int i = 0; i < n; i++) {
-        const char *cn = class_getName(cl[i]);
-        if (!cn) continue;
-        if (logged < 40 && (strstr(cn, "DeviceProps") || strstr(cn, "CompanionProps") || strstr(cn, "HistorySyncConfig")) && ![gPropsSeen containsObject:@(cn)]) {
-            [gPropsSeen addObject:@(cn)]; logged++;
-            FZ(@"FckZck 1.27: found class %s", cn);
-        }
-        for (int k = 0; k < 4; k++) {
-            SEL s = sel_registerName(sels[k]);
-            Method m = class_getInstanceMethod(cl[i], s);
-            if (!m) continue;
-            NSString *key = [NSString stringWithFormat:@"%s.%s", cn, sels[k]];
-            if ([gPropsSeen containsObject:key]) continue;
-            [gPropsSeen addObject:key];
-            const char *enc = method_getTypeEncoding(m);
-            FZ(@"FckZck 1.27: candidate %s %s enc=%s", cn, sels[k], enc ? enc : "?");
-            if (enc && strncmp(enc, "v24@0:8@16", 10) == 0) { FZHookPropsSetter(cl[i], s); gPropsHooks++; }
-        }
-    }
-    free(cl);
-}
-static void FZScanLoop(int left) {
-    FZScanDeviceProps();
-    FZInstallCompanionHooks();
-    FZInstallPayloadHook();
-    FZInstallTraceHooks();
-    if (left > 0) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ FZScanLoop(left - 1); });
-    else FZ(@"FckZck 1.27: scan finished, hooks=%d", gPropsHooks);
-}
-// -------------------------------------------------------------------------
-
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.28 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.26 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1343,8 +958,6 @@ static void FZScanLoop(int left) {
             }
         });
     }
-    FZScanLoop(45);
-    FZDumpClassesMatching(@[@"CompanionProps", @"CompanionRegData", @"CompanionDeviceInfo"], @"fckzck-companion-classes.txt");
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSString *frameworkPath = [bundlePath stringByAppendingPathComponent:@"Frameworks/SharedModules.framework/SharedModules"];
     MSImageRef image = MSGetImageByName([frameworkPath UTF8String]);
@@ -1361,7 +974,6 @@ static void FZScanLoop(int left) {
     hookSymbol(image, "_WADeprecatedPlatformCutOffDate", (void *)&_new_WADeprecatedPlatformCutOffDate, (void **)&_orig_WADeprecatedPlatformCutOffDate);
     hookSymbol(image, "_WAIsPlatformDeprecated", (void *)&_new_WAIsPlatformDeprecated, (void **)&_orig_WAIsPlatformDeprecated);
     hookSymbol(image, "_WAShouldShowPlatformDeprecationNags", (void *)&_new_WAShouldShowPlatformDeprecationNags, (void **)&_orig_WAShouldShowPlatformDeprecationNags);
-    FZInstallPayloadFnHooks(image);
 }
 
 %hook WALogWriter
