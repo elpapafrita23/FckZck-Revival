@@ -51,6 +51,8 @@ static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping 
 // Experiment: OS version declared to the server in ClientPayload.UserAgent.
 // Config keys (strings): osVersion, osBuildNumber. An EMPTY osVersion disables
 // the override (the real iOS version is sent).
+static BOOL gReqFullSync = YES;   // 1.27: ask the phone for full history at pairing
+static int gHistDays = 365;       // 1.27: days of history requested
 static NSString *gOsVersion = nil;
 static NSString *gOsBuild = nil;
 
@@ -131,6 +133,11 @@ static void FZLoadConfig(void) {
     id ff = cfg[@"forceFinishBootstrapSeconds"];
     if ([ff isKindOfClass:[NSNumber class]]) gForceFinishSeconds = [ff intValue];
     FZ(@"FckZck: forceFinishBootstrapSeconds=%d", gForceFinishSeconds);
+    id rf = cfg[@"requireFullSync"];
+    if ([rf respondsToSelector:@selector(boolValue)]) gReqFullSync = [rf boolValue];
+    id hd = cfg[@"historyDays"];
+    if ([hd isKindOfClass:[NSNumber class]]) gHistDays = [hd intValue];
+    FZ(@"FckZck 1.27: requireFullSync=%d historyDays=%d", gReqFullSync, gHistDays);
     id so = cfg[@"signalDeprecatedOverride"];
     if ([so isKindOfClass:[NSNumber class]]) gDeprecatedOverride = [so intValue];
     FZ(@"FckZck: signalDeprecatedOverride=%d", gDeprecatedOverride);
@@ -930,9 +937,92 @@ static BOOL FZInstallSignalHooks(void) {
 }
 // -------------------------------------------------------------------------
 
+// ---- 1.27: DeviceProps (what the companion tells the PRIMARY PHONE) -----------
+// Log: the phone only sent INITIAL_BOOTSTRAP(0), STATUS(1), PUSH_NAME(4) and NON_BLOCKING(5);
+// RECENT(3)/FULL(2) history chunks never arrived. The phone decides that from the DeviceProps
+// sent at pairing (app version + historySyncConfig). Those still carried the real old app
+// version and no full-sync request. We now spoof the version there too and ask for full history.
+// Only takes effect at pairing time: unlink and link the device again after installing.
+#define FZ_DPV(N, IDX) \
+static void (*orig_dpv##N)(id, SEL, unsigned int); \
+static void new_dpv##N(id s, SEL c, unsigned int v) { orig_dpv##N(s, c, (unsigned int)gNum[IDX]); }
+FZ_DPV(0, 0) FZ_DPV(1, 1) FZ_DPV(2, 2) FZ_DPV(3, 3)
+
+static BOOL FZHookSetter32(Class c, const char *sel, IMP repl, IMP *orig) {
+    SEL s = sel_registerName(sel);
+    Method m = class_getInstanceMethod(c, s);
+    if (!m) { FZ(@"FckZck: %s has no %s", class_getName(c), sel); return NO; }
+    const char *enc = method_getTypeEncoding(m);
+    if (!enc || (strncmp(enc, "v20@0:8I16", 10) != 0 && strncmp(enc, "v20@0:8i16", 10) != 0)) {
+        FZ(@"FckZck: %s %s unexpected type %s, not hooked", class_getName(c), sel, enc ? enc : "?");
+        return NO;
+    }
+    MSHookMessageEx(c, s, repl, orig);
+    FZ(@"FckZck: hooked %s %s", class_getName(c), sel);
+    return YES;
+}
+
+static void FZSetKey(id o, NSString *k, id v) {
+    @try { [o setValue:v forKey:k]; FZ(@"FckZck 1.27: DeviceProps %@=%@ (now %@)", k, v, [o valueForKey:k]); }
+    @catch (NSException *e) { FZ(@"FckZck 1.27: DeviceProps cannot set %@: %@", k, e.reason); }
+}
+
+static void FZTuneDeviceProps(id dp) {
+    static BOOL busy = NO;
+    if (busy || !dp) return;
+    busy = YES;
+    @try {
+        id cfg = nil;
+        @try { cfg = [dp valueForKey:@"historySyncConfig"]; } @catch (NSException *e) { cfg = nil; }
+        Class cc = objc_getClass("WAPBDeviceProps_HistorySyncConfig");
+        if (!cfg && cc) { cfg = [[cc alloc] init]; FZSetKey(dp, @"historySyncConfig", cfg); }
+        FZSetKey(dp, @"requireFullSync", @(gReqFullSync));
+        if (cfg) {
+            FZSetKey(cfg, @"fullSyncDaysLimit", @(gHistDays));
+            FZSetKey(cfg, @"recentSyncDaysLimit", @(gHistDays));
+            FZSetKey(cfg, @"fullSyncSizeMbLimit", @(1024));
+            FZSetKey(cfg, @"storageQuotaMb", @(10240));
+        } else FZ(@"FckZck 1.27: no WAPBDeviceProps_HistorySyncConfig");
+    } @catch (NSException *e) { FZ(@"FckZck 1.27: tune exception %@", e); }
+    busy = NO;
+}
+
+static void (*orig_dpPlat)(id, SEL, unsigned int);
+static void new_dpPlat(id self, SEL _cmd, unsigned int v) {
+    orig_dpPlat(self, _cmd, v);
+    FZ(@"FckZck 1.27: DeviceProps.setPlatformType(%u)", v);
+    FZTuneDeviceProps(self);
+}
+static void (*orig_dpCfg)(id, SEL, id);
+static void new_dpCfg(id self, SEL _cmd, id cfg) {
+    orig_dpCfg(self, _cmd, cfg);
+    FZTuneDeviceProps(self);
+}
+
+static BOOL gDevPropsHooked = NO;
+static BOOL FZInstallDevicePropsHooks(void) {
+    if (gDevPropsHooked) return YES;
+    Class dv = objc_getClass("WAPBDeviceProps_AppVersion");
+    Class dp = objc_getClass("WAPBDeviceProps");
+    if (!dv && !dp) return NO;
+    if (dv) {
+        FZHookSetter32(dv, "setPrimary:",    (IMP)new_dpv0, (IMP *)&orig_dpv0);
+        FZHookSetter32(dv, "setSecondary:",  (IMP)new_dpv1, (IMP *)&orig_dpv1);
+        FZHookSetter32(dv, "setTertiary:",   (IMP)new_dpv2, (IMP *)&orig_dpv2);
+        FZHookSetter32(dv, "setQuaternary:", (IMP)new_dpv3, (IMP *)&orig_dpv3);
+    } else FZ(@"FckZck: WAPBDeviceProps_AppVersion not found");
+    if (dp) {
+        FZHookSetter32(dp, "setPlatformType:", (IMP)new_dpPlat, (IMP *)&orig_dpPlat);
+        FZHookIfPresent(dp, "setHistorySyncConfig:", "v24@0:8@16", (IMP)new_dpCfg, (IMP *)&orig_dpCfg);
+    } else FZ(@"FckZck: WAPBDeviceProps not found");
+    gDevPropsHooked = YES;
+    return YES;
+}
+// -------------------------------------------------------------------------
+
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.26 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.27 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -956,6 +1046,11 @@ static BOOL FZInstallSignalHooks(void) {
                     if (!FZInstallHistoryHooks()) FZ(@"FckZck: history-sync classes still not found");
                 });
             }
+        });
+    }
+    if (!FZInstallDevicePropsHooks()) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!FZInstallDevicePropsHooks()) FZ(@"FckZck: DeviceProps classes still not found");
         });
     }
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
