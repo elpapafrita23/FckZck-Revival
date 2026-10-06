@@ -639,9 +639,25 @@ static BOOL new_hasSess(id self, SEL _cmd, id addr) {
 }
 
 static id (*orig_getPre)(id, SEL, int);
+static BOOL gProbing = NO;
 static id new_getPre(id self, SEL _cmd, int pid) {
     id r = orig_getPre(self, _cmd, pid);
     FZ(@"FckZck: KeyStore.fetchPreKeyRecordForId %d -> %@", pid, r ? @"found" : @"MISSING");
+    // 1.16 diagnostic: on a miss, probe a few other ids to see WHICH one-time prekeys
+    // exist locally (the server was given ids 1..200 at registration). Read-only.
+    if (!r && !gProbing) {
+        gProbing = YES;
+        @try {
+            int ids[] = {1, 2, 50, 99, 100, 102, 150, 199, 200, 201, 300, 500};
+            NSMutableString *p = [NSMutableString string];
+            for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+                id x = orig_getPre(self, _cmd, ids[i]);
+                [p appendFormat:@" %d=%@", ids[i], x ? @"Y" : @"n"];
+            }
+            FZ(@"FckZck: prekey probe after miss of %d:%@", pid, p);
+        } @catch (NSException *e) {}
+        gProbing = NO;
+    }
     return r;
 }
 
@@ -705,7 +721,7 @@ static BOOL FZInstallSignalHooks(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.15.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.16.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
