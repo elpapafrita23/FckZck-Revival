@@ -243,7 +243,7 @@ __attribute__((unused)) static void FZDumpClasses(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.5.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.6.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSString *frameworkPath = [bundlePath stringByAppendingPathComponent:@"Frameworks/SharedModules.framework/SharedModules"];
     MSImageRef image = MSGetImageByName([frameworkPath UTF8String]);
@@ -373,7 +373,13 @@ __attribute__((unused)) static void FZDumpClasses(void) {
             NSString *n = [(id<FZElem>)child name];
             if ([n isEqualToString:@"ref-cert"] || [n isEqualToString:@"client-props"]) {
                 NSData *d = [(id<FZElem>)child dataValue];
-                FZ(@"FckZck: addChild %@ dataValue=%lu bytes (at add time)", n, (unsigned long)d.length);
+                NSUInteger kids = [[(id<FZElem>)child children] count];
+                NSString *hex = (d.length > 0 && d.length <= 4) ? [NSString stringWithFormat:@" bytes=%@", d] : @"";
+                FZ(@"FckZck: addChild %@ dataValue=%lu bytes children=%lu%@", n, (unsigned long)d.length, (unsigned long)kids, hex);
+                if (gSkipEmptyRefCert && [n isEqualToString:@"ref-cert"] && d.length == 0 && kids == 0) {
+                    FZ(@"FckZck: skipped empty ref-cert");
+                    return;
+                }
             }
         }
     } @catch (NSException *e) {}
