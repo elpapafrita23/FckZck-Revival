@@ -7,5 +7,6 @@ TWEAK_NAME = FckZck
 
 FckZck_FILES = Tweak.xm
 FckZck_CFLAGS = -fobjc-arc
+FckZck_FRAMEWORKS = Security
 
 include $(THEOS_MAKE_PATH)/tweak.mk

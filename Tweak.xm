@@ -2,6 +2,7 @@
 #include <substrate.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
+#import <Security/Security.h>
 
 // ---- Configurable version ----------------------------------------------
 // Read from /var/mobile/Library/Preferences/com.ifilipis.fckzck.plist
@@ -13,8 +14,8 @@ static NSString *gVersion = nil;
 static NSString *gHash = nil;
 static int gNum[4] = {2, 26, 38, 74};
 // Experiment: drop an EMPTY <ref-cert> node from the pair-device request.
-// Config key: <key>skipEmptyRefCert</key><false/> to turn it off.
-static BOOL gSkipEmptyRefCert = YES;
+// Config key: <key>skipEmptyRefCert</key><true/> to turn it on.
+static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping did not fix the 400)
 // Experiment: OS version declared to the server in ClientPayload.UserAgent.
 // Config keys (strings): osVersion, osBuildNumber. An EMPTY osVersion disables
 // the override (the real iOS version is sent).
@@ -212,13 +213,14 @@ static void FZDumpElem(id<FZElem> e, int depth, NSMutableString *out) {
 // 20 s after launch, writes the names + method selectors + type encodings of
 // every class related to pairing / companion / ADV / stanzas to
 // <app Documents>/fckzck-classes.txt. Only in the main WhatsApp apps.
-__attribute__((unused)) static void FZDumpClasses(void) {
+static void FZDumpClasses(void) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     if (![bid isEqualToString:@"net.whatsapp.WhatsApp"] && ![bid isEqualToString:@"net.whatsapp.WhatsAppSMB"]) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSArray *pats = @[@"Pair", @"Companion", @"ADV", @"DeviceProps", @"DeviceIdentity",
-                          @"WAWebClient", @"LinkedDevice", @"LinkCode", @"Stanza"];
+                          @"WAWebClient", @"LinkedDevice", @"LinkCode", @"Stanza",
+                          @"PreKey", @"SignedPreKey", @"SignalStore", @"SignalSession", @"IdentityStore"];
         NSMutableString *out = [NSMutableString string];
         unsigned int n = 0;
         Class *classes = objc_copyClassList(&n);
@@ -313,15 +315,44 @@ static BOOL FZInstallUserAgentHooks(void) {
 }
 // -------------------------------------------------------------------------
 
+// ---- Keychain failure logging (diagnostic) ---------------------------------
+// Logs service/account/access-group and OSStatus of failed SecItemAdd/Update.
+// Never logs secret values. Duplicate-item (-25299) is normal noise.
+static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *);
+static OSStatus new_SecItemAdd(CFDictionaryRef attrs, CFTypeRef *result) {
+    OSStatus st = orig_SecItemAdd(attrs, result);
+    if (st != errSecSuccess && st != errSecDuplicateItem) {
+        NSDictionary *d = (__bridge NSDictionary *)attrs;
+        FZ(@"FckZck: SecItemAdd FAILED status=%d svce=%@ acct=%@ agrp=%@", (int)st,
+           d[(__bridge id)kSecAttrService], d[(__bridge id)kSecAttrAccount], d[(__bridge id)kSecAttrAccessGroup]);
+    }
+    return st;
+}
+
+static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef, CFDictionaryRef);
+static OSStatus new_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef upd) {
+    OSStatus st = orig_SecItemUpdate(query, upd);
+    if (st != errSecSuccess && st != errSecItemNotFound) {
+        NSDictionary *d = (__bridge NSDictionary *)query;
+        FZ(@"FckZck: SecItemUpdate FAILED status=%d svce=%@ acct=%@ agrp=%@", (int)st,
+           d[(__bridge id)kSecAttrService], d[(__bridge id)kSecAttrAccount], d[(__bridge id)kSecAttrAccessGroup]);
+    }
+    return st;
+}
+// -------------------------------------------------------------------------
+
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.7.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.8.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!FZInstallUserAgentHooks()) FZ(@"FckZck: WAPBClientPayload_UserAgent still not found");
         });
     }
+    MSHookFunction((void *)SecItemAdd, (void *)new_SecItemAdd, (void **)&orig_SecItemAdd);
+    MSHookFunction((void *)SecItemUpdate, (void *)new_SecItemUpdate, (void **)&orig_SecItemUpdate);
+    FZDumpClasses();
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSString *frameworkPath = [bundlePath stringByAppendingPathComponent:@"Frameworks/SharedModules.framework/SharedModules"];
     MSImageRef image = MSGetImageByName([frameworkPath UTF8String]);
