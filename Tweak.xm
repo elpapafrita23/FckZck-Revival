@@ -15,13 +15,13 @@ static int gNum[4] = {2, 26, 38, 74};
 // Experiment: drop an EMPTY <ref-cert> node from the pair-device request.
 // Config key: <key>skipEmptyRefCert</key><true/> to turn it on.
 static NSString *gHistoryMode = @"continue";
-static NSNumber *gForceSyncState = nil;
+static NSNumber *gForceSyncState = @2;  // 1.19 test: observed timeout state is 1; assume 2 is finished, configurable.
 // Experiment (1.11): the app logs itself out ~120 s after pairing because history sync never
 // completes (reason "history_sync_timeout"). When ON, that single logout is swallowed and the
 // bootstrap is told the initial history sync finished instead.
 // Config keys: blockHistoryTimeoutLogout (bool, default ON),
 //              historyTimeoutRemovalReason (integer, default 11 = value seen in log 2).
-static BOOL gBlockHistoryTimeoutLogout = NO;  // 1.12: OFF. Log 3 showed it only leaves an endless spinner (server rejects the device with 401 on relaunch)
+static BOOL gBlockHistoryTimeoutLogout = YES;  // 1.19 test: block the observed companion timeout logout by default. Log 3 showed it only leaves an endless spinner (server rejects the device with 401 on relaunch)
 // Experiment (1.12): force WASignalAddress "deprecated" for individual (non-group) sessions.
 // -1 = leave as is, 0 = force NO (default), 1 = force YES. Config key: signalDeprecatedOverride (integer).
 static int gDeprecatedOverride = 0;
@@ -35,6 +35,8 @@ static BOOL gLidFallback = YES;
 // history sync finished N seconds after pairing, tell it ourselves. 0 = off.
 // Config key: forceFinishBootstrapSeconds (integer).
 static int gForceFinishSeconds = 40;
+// 1.19 test: make the companion service report initial history sync as finished.
+static BOOL gForceInitialSyncFinished = YES;
 static BOOL gInitialCalled = NO;
 static BOOL gSecCalled = NO;
 static __weak id gHistSvc = nil;
@@ -132,8 +134,11 @@ static void FZLoadConfig(void) {
     id hm = cfg[@"historySyncFailureMode"];
     if ([hm isKindOfClass:[NSString class]] && [(NSString *)hm length]) gHistoryMode = hm;
     FZ(@"FckZck: historySyncFailureMode=%@", gHistoryMode);
+    id fis = cfg[@"forceInitialSyncFinished"];
+    if ([fis respondsToSelector:@selector(boolValue)]) gForceInitialSyncFinished = [fis boolValue];
+    FZ(@"FckZck: forceInitialSyncFinished=%d", gForceInitialSyncFinished);
     id fs = cfg[@"forceSyncState"];
-    if ([fs isKindOfClass:[NSNumber class]]) { gForceSyncState = fs; FZ(@"FckZck: forceSyncState=%@", fs); }
+    if ([fs isKindOfClass:[NSNumber class]]) { gForceSyncState = fs; FZ(@"FckZck: forceSyncState=%@", fs); } else { FZ(@"FckZck: forceSyncState default=%@", gForceSyncState); }
     id ov = cfg[@"osVersion"];
     if ([ov isKindOfClass:[NSString class]]) gOsVersion = [(NSString *)ov length] ? ov : nil;
     id ob = cfg[@"osBuildNumber"];
@@ -474,6 +479,10 @@ static BOOL new_isInit(id self, SEL _cmd) {
     BOOL r = orig_isInit(self, _cmd);
     static int last = -1;
     if (last != (int)r) { last = (int)r; FZ(@"FckZck: HistorySyncCompanionService.isInitialSyncFinished -> %d", r); }
+    if (gForceInitialSyncFinished) {
+        FZ(@"FckZck: forcing isInitialSyncFinished -> YES");
+        return YES;
+    }
     return r;
 }
 static void (*orig_runWhen)(id, SEL, id);
