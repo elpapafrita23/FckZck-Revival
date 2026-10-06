@@ -15,6 +15,11 @@ static int gNum[4] = {2, 26, 38, 74};
 // Experiment: drop an EMPTY <ref-cert> node from the pair-device request.
 // Config key: <key>skipEmptyRefCert</key><false/> to turn it off.
 static BOOL gSkipEmptyRefCert = YES;
+// Experiment: OS version declared to the server in ClientPayload.UserAgent.
+// Config keys (strings): osVersion, osBuildNumber. An EMPTY osVersion disables
+// the override (the real iOS version is sent).
+static NSString *gOsVersion = @"15.8.3";
+static NSString *gOsBuild = @"19H386";
 
 // ---- File logging -------------------------------------------------------
 // Writes to <app Documents>/fckzck.log (and NSLog). Lets you read the log with
@@ -61,6 +66,12 @@ static void FZLoadConfig(void) {
     NSString *v = cfg[@"version"];
     id skip = cfg[@"skipEmptyRefCert"];
     if ([skip respondsToSelector:@selector(boolValue)]) gSkipEmptyRefCert = [skip boolValue];
+    id ov = cfg[@"osVersion"];
+    if ([ov isKindOfClass:[NSString class]]) gOsVersion = [(NSString *)ov length] ? ov : nil;
+    id ob = cfg[@"osBuildNumber"];
+    if ([ob isKindOfClass:[NSString class]]) gOsBuild = [(NSString *)ob length] ? ob : nil;
+    if (!gOsVersion) gOsBuild = nil;
+    FZ(@"FckZck: osVersion override=%@ osBuildNumber override=%@", gOsVersion ? gOsVersion : @"(off)", gOsBuild ? gOsBuild : @"(off)");
     if ([v isKindOfClass:[NSString class]] && v.length) wanted = v;
     else FZ(@"FckZck: no config found, using default version");
 
@@ -241,9 +252,76 @@ __attribute__((unused)) static void FZDumpClasses(void) {
 }
 // -------------------------------------------------------------------------
 
+// ---- ClientPayload.UserAgent OS-version experiment -------------------------
+static void (*orig_setOsVersion)(id, SEL, id);
+static void new_setOsVersion(id self, SEL _cmd, id v) {
+    FZ(@"FckZck: UserAgent.setOsVersion(%@) -> %@", v, gOsVersion ? gOsVersion : @"(unchanged)");
+    orig_setOsVersion(self, _cmd, gOsVersion ? gOsVersion : v);
+}
+
+static void (*orig_setOsBuildNumber)(id, SEL, id);
+static void new_setOsBuildNumber(id self, SEL _cmd, id v) {
+    FZ(@"FckZck: UserAgent.setOsBuildNumber(%@) -> %@", v, gOsBuild ? gOsBuild : @"(unchanged)");
+    orig_setOsBuildNumber(self, _cmd, gOsBuild ? gOsBuild : v);
+}
+
+static void (*orig_setDevice)(id, SEL, id);
+static void new_setDevice(id self, SEL _cmd, id v) {
+    FZ(@"FckZck: UserAgent.setDevice(%@)", v);
+    orig_setDevice(self, _cmd, v);
+}
+
+static void (*orig_setManufacturer)(id, SEL, id);
+static void new_setManufacturer(id self, SEL _cmd, id v) {
+    FZ(@"FckZck: UserAgent.setManufacturer(%@)", v);
+    orig_setManufacturer(self, _cmd, v);
+}
+
+static void FZHookSetter(Class c, const char *selName, IMP repl, IMP *orig) {
+    SEL sel = sel_registerName(selName);
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) { FZ(@"FckZck: UserAgent has no %s", selName); return; }
+    const char *enc = method_getTypeEncoding(m);
+    if (!enc || strcmp(enc, "v24@0:8@16") != 0) {
+        FZ(@"FckZck: UserAgent %s has unexpected type %s, not hooked", selName, enc ? enc : "?");
+        return;
+    }
+    MSHookMessageEx(c, sel, repl, orig);
+    FZ(@"FckZck: hooked UserAgent %s", selName);
+}
+
+static BOOL FZInstallUserAgentHooks(void) {
+    Class c = objc_getClass("WAPBClientPayload_UserAgent");
+    if (!c) return NO;
+    unsigned int mc = 0;
+    Method *ms = class_copyMethodList(c, &mc);
+    NSMutableArray *names = [NSMutableArray array];
+    for (unsigned int j = 0; j < mc; j++) {
+        const char *n = sel_getName(method_getName(ms[j]));
+        if (strncmp(n, "set", 3) == 0) {
+            const char *enc = method_getTypeEncoding(ms[j]);
+            [names addObject:[NSString stringWithFormat:@"%s(%s)", n, enc ? enc : ""]];
+        }
+    }
+    free(ms);
+    FZ(@"FckZck: UserAgent setters: %@", [names componentsJoinedByString:@" "]);
+    FZHookSetter(c, "setOsVersion:", (IMP)new_setOsVersion, (IMP *)&orig_setOsVersion);
+    FZHookSetter(c, "setOsBuildNumber:", (IMP)new_setOsBuildNumber, (IMP *)&orig_setOsBuildNumber);
+    FZHookSetter(c, "setDevice:", (IMP)new_setDevice, (IMP *)&orig_setDevice);
+    FZHookSetter(c, "setManufacturer:", (IMP)new_setManufacturer, (IMP *)&orig_setManufacturer);
+    return YES;
+}
+// -------------------------------------------------------------------------
+
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.6.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.7.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    if (!FZInstallUserAgentHooks()) {
+        FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!FZInstallUserAgentHooks()) FZ(@"FckZck: WAPBClientPayload_UserAgent still not found");
+        });
+    }
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSString *frameworkPath = [bundlePath stringByAppendingPathComponent:@"Frameworks/SharedModules.framework/SharedModules"];
     MSImageRef image = MSGetImageByName([frameworkPath UTF8String]);
