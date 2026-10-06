@@ -412,6 +412,7 @@ static void new_hsFailure(id self, SEL _cmd, id reason) {
 }
 
 static void FZLogHistoryServiceObjects(id self, NSString *phase);
+static BOOL (*orig_isInit)(id, SEL);
 
 static void (*orig_hsHandle)(id, SEL, id, id);
 static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
@@ -601,7 +602,6 @@ static BOOL FZHookIfPresent(Class c, const char *selName, const char *wantEnc, I
 @end
 
 // WAHistorySyncCompanionService: ObjC surface seen in log 5 (everything else is Swift).
-static BOOL (*orig_isInit)(id, SEL);
 static BOOL new_isInit(id self, SEL _cmd) {
     BOOL r = orig_isInit(self, _cmd);
     static int last = -1;
