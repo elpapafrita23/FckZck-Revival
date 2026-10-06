@@ -53,11 +53,11 @@ Edit the string (Filza works), force-quit WhatsApp and open it again. No resprin
 
 The tweak writes `fckzck.log` to the WhatsApp app container (`Documents/`), reset on every launch. It contains the tweak's own lines (which hooks worked, which version was applied) plus the WhatsApp internal log lines about connection, pairing/linking, crypto and errors. Search for it with Filza. It may contain account identifiers, so redact it before sharing.
 
-## 1.27.1 (fix: WhatsApp se desvincula ~2 min después de vincular, iOS 12)
+## 1.26 (fix: WhatsApp se desvincula ~2 min después de vincular, iOS 12)
 
 Causa (según `fckzck.log`): el servidor entrega INITIAL_BOOTSTRAP, pero en iOS 12 el código Swift de WhatsApp nunca llama a `handleInitialHistorySync` ni a `handleSecurityNotificationSetting`. A los ~120 s la app se auto-elimina con `remove-companion-device reason="history_sync_timeout"`. El chequeo de 1.25 miraba el payload *después* de que WhatsApp lo consumiera, por eso nunca se activaba.
 
-Qué hace 1.27.1: detecta INITIAL_BOOTSTRAP con `hasInitialHistBootstrapInlinePayload` (antes de procesarlo), completa los dos pasos del bootstrap a mano, tiene un temporizador de respaldo (`forceFinishBootstrapSeconds`, 25 s) y bloquea el logout de razón 11 como última red de seguridad (`blockHistoryTimeoutLogout`, ON por defecto).
+Qué hace 1.26: detecta INITIAL_BOOTSTRAP con `hasInitialHistBootstrapInlinePayload` (antes de procesarlo), completa los dos pasos del bootstrap a mano, tiene un temporizador de respaldo (`forceFinishBootstrapSeconds`, 25 s) y bloquea el logout de razón 11 como última red de seguridad (`blockHistoryTimeoutLogout`, ON por defecto).
 
 ## Known limitations
 
