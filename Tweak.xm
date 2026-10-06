@@ -15,13 +15,13 @@ static int gNum[4] = {2, 26, 38, 74};
 // Experiment: drop an EMPTY <ref-cert> node from the pair-device request.
 // Config key: <key>skipEmptyRefCert</key><true/> to turn it on.
 static NSString *gHistoryMode = @"continue";
-static NSNumber *gForceSyncState = @2;  // 1.19 test: observed timeout state is 1; assume 2 is finished, configurable.
+static NSNumber *gForceSyncState = nil;  // 1.20 diagnostic: observe the real UI state; do not force it.
 // Experiment (1.11): the app logs itself out ~120 s after pairing because history sync never
 // completes (reason "history_sync_timeout"). When ON, that single logout is swallowed and the
 // bootstrap is told the initial history sync finished instead.
 // Config keys: blockHistoryTimeoutLogout (bool, default ON),
 //              historyTimeoutRemovalReason (integer, default 11 = value seen in log 2).
-static BOOL gBlockHistoryTimeoutLogout = YES;  // 1.19 test: block the observed companion timeout logout by default. Log 3 showed it only leaves an endless spinner (server rejects the device with 401 on relaunch)
+static BOOL gBlockHistoryTimeoutLogout = YES;  // 1.20 diagnostic: keep the companion alive at timeout so we can inspect the real state.
 // Experiment (1.12): force WASignalAddress "deprecated" for individual (non-group) sessions.
 // -1 = leave as is, 0 = force NO (default), 1 = force YES. Config key: signalDeprecatedOverride (integer).
 static int gDeprecatedOverride = 0;
@@ -34,9 +34,9 @@ static BOOL gLidFallback = YES;
 // Experiment (1.13): if the bootstrap ("loading your chats") has not been told that the initial
 // history sync finished N seconds after pairing, tell it ourselves. 0 = off.
 // Config key: forceFinishBootstrapSeconds (integer).
-static int gForceFinishSeconds = 40;
+static int gForceFinishSeconds = 0;  // 1.20 diagnostic: do not synthesize bootstrap completion.
 // 1.19 test: make the companion service report initial history sync as finished.
-static BOOL gForceInitialSyncFinished = YES;
+static BOOL gForceInitialSyncFinished = NO;  // 1.20 diagnostic: observe the real service state.
 static BOOL gInitialCalled = NO;
 static BOOL gSecCalled = NO;
 static __weak id gHistSvc = nil;
@@ -453,6 +453,87 @@ static long long new_syncState(id self, SEL _cmd) {
     return v;
 }
 
+
+static BOOL FZHookIfPresent(Class c, const char *selName, const char *wantEnc, IMP repl, IMP *orig);
+
+// 1.20 diagnostic hooks discovered from the class dump.
+// These deliberately OBSERVE the real History Sync state; they do not force completion.
+static BOOL (*orig_deviceInitial)(id, SEL);
+static BOOL new_deviceInitial(id self, SEL _cmd) {
+    BOOL v = orig_deviceInitial(self, _cmd);
+    static int last = -1;
+    if (last != (int)v) { last = (int)v; FZ(@"FckZck: HistorySyncDevice.isInitialSyncFinished=%d", v); }
+    return v;
+}
+
+static BOOL (*orig_deviceSyncing)(id, SEL);
+static BOOL new_deviceSyncing(id self, SEL _cmd) {
+    BOOL v = orig_deviceSyncing(self, _cmd);
+    static int last = -1;
+    if (last != (int)v) { last = (int)v; FZ(@"FckZck: HistorySyncDevice.isSyncing=%d", v); }
+    return v;
+}
+
+static BOOL (*orig_deviceCompleted)(id, SEL);
+static BOOL new_deviceCompleted(id self, SEL _cmd) {
+    BOOL v = orig_deviceCompleted(self, _cmd);
+    static int last = -1;
+    if (last != (int)v) { last = (int)v; FZ(@"FckZck: HistorySyncDevice.isCompleted=%d", v); }
+    return v;
+}
+
+static unsigned int (*orig_initialState)(id, SEL);
+static unsigned int new_initialState(id self, SEL _cmd) {
+    unsigned int v = orig_initialState(self, _cmd);
+    static unsigned int last = UINT_MAX;
+    if (last != v) { last = v; FZ(@"FckZck: PBBProtoInitialSyncStateUpdate.state=%u", v); }
+    return v;
+}
+
+static double (*orig_initialProgress)(id, SEL);
+static double new_initialProgress(id self, SEL _cmd) {
+    double v = orig_initialProgress(self, _cmd);
+    static double last = -1.0;
+    if (last < 0.0 || fabs(last - v) >= 0.01) { last = v; FZ(@"FckZck: PBBProtoInitialSyncStateUpdate.progress=%.4f", v); }
+    return v;
+}
+
+static void (*orig_devicesModified)(id, SEL, id);
+static void new_devicesModified(id self, SEL _cmd, id notification) {
+    FZ(@"FckZck: HistorySyncCompanionDevicesListener.companionDevicesModifiedWithNotification=%@", FZDesc(notification));
+    orig_devicesModified(self, _cmd, notification);
+}
+
+static void (*orig_pairingTimedOut)(id, SEL, id);
+static void new_pairingTimedOut(id self, SEL _cmd, id notification) {
+    FZ(@"FckZck: HistorySyncCompanionDevicesListener.companionPairingTimedOutWithNotification=%@", FZDesc(notification));
+    orig_pairingTimedOut(self, _cmd, notification);
+}
+
+static BOOL FZInstallDiagnosticHistoryHooks(void) {
+    Class device = objc_getClass("WAHistorySync.HistorySyncDevice");
+    if (!device) device = objc_getClass("_TtC13WAHistorySync17HistorySyncDevice");
+    if (device) {
+        FZHookIfPresent(device, "isInitialSyncFinished", "B16@0:8", (IMP)new_deviceInitial, (IMP *)&orig_deviceInitial);
+        FZHookIfPresent(device, "isSyncing", "B16@0:8", (IMP)new_deviceSyncing, (IMP *)&orig_deviceSyncing);
+        FZHookIfPresent(device, "isCompleted", "B16@0:8", (IMP)new_deviceCompleted, (IMP *)&orig_deviceCompleted);
+    } else FZ(@"FckZck: HistorySyncDevice not found");
+
+    Class state = objc_getClass("PBBProtoInitialSyncStateUpdate");
+    if (state) {
+        FZHookIfPresent(state, "state", "I16@0:8", (IMP)new_initialState, (IMP *)&orig_initialState);
+        FZHookIfPresent(state, "progress", "d16@0:8", (IMP)new_initialProgress, (IMP *)&orig_initialProgress);
+    } else FZ(@"FckZck: PBBProtoInitialSyncStateUpdate not found");
+
+    Class listener = objc_getClass("WAHistorySync.HistorySyncCompanionDevicesListener");
+    if (!listener) listener = objc_getClass("_TtC13WAHistorySync34HistorySyncCompanionDevicesListener");
+    if (listener) {
+        FZHookIfPresent(listener, "companionDevicesModifiedWithNotification:", "v24@0:8@16", (IMP)new_devicesModified, (IMP *)&orig_devicesModified);
+        FZHookIfPresent(listener, "companionPairingTimedOutWithNotification:", "v24@0:8@16", (IMP)new_pairingTimedOut, (IMP *)&orig_pairingTimedOut);
+    } else FZ(@"FckZck: HistorySyncCompanionDevicesListener not found");
+    return YES;
+}
+
 static BOOL FZHookIfPresent(Class c, const char *selName, const char *wantEnc, IMP repl, IMP *orig) {
     SEL sel = sel_registerName(selName);
     Method m = class_getInstanceMethod(c, sel);
@@ -600,6 +681,7 @@ static BOOL FZInstallHistoryHooks(void) {
     }
     else FZ(@"FckZck: WAHistorySyncCompanionService not found");
     if (lgr) FZHookIfPresent(lgr, "handlePreKeysUploadFail:", "v24@0:8@16", (IMP)new_preKeyFail, (IMP *)&orig_preKeyFail);
+    FZInstallDiagnosticHistoryHooks();
     gHistoryHooksDone = YES;
     return YES;
 }
