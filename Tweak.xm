@@ -1343,7 +1343,7 @@ static NSArray *FZSymbols(const struct mach_header_64 *mh) {
     const char *str = (const char *)(base + st->stroff);
     for (uint32_t i = 0; i < st->nsyms; i++) {
         if ((nl[i].n_type & N_TYPE) != N_SECT) continue;
-        const char *nm = str + nl[i].n_strx;
+        const char *nm = str + nl[i].n_un.n_strx;
         if (nm[0]) [out addObject:@(nm)];
     }
     return out;
