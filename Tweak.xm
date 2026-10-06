@@ -41,7 +41,6 @@ static BOOL gInitialCalled = NO;
 static BOOL gSecCalled = NO;
 static __weak id gHistSvc = nil;
 static long long gBlockLogoutReason = 11;
-static BOOL gBootstrapSeen = NO;
 static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping did not fix the 400)
 // Experiment: OS version declared to the server in ClientPayload.UserAgent.
 // Config keys (strings): osVersion, osBuildNumber. An EMPTY osVersion disables
