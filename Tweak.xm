@@ -12,6 +12,9 @@
 static NSString *gVersion = nil;
 static NSString *gHash = nil;
 static int gNum[4] = {2, 26, 38, 74};
+// Experiment: drop an EMPTY <ref-cert> node from the pair-device request.
+// Config key: <key>skipEmptyRefCert</key><false/> to turn it off.
+static BOOL gSkipEmptyRefCert = YES;
 
 // ---- File logging -------------------------------------------------------
 // Writes to <app Documents>/fckzck.log (and NSLog). Lets you read the log with
@@ -56,6 +59,8 @@ static void FZLoadConfig(void) {
     NSString *wanted = DEFAULT_VERSION;
     NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.ifilipis.fckzck.plist"];
     NSString *v = cfg[@"version"];
+    id skip = cfg[@"skipEmptyRefCert"];
+    if ([skip respondsToSelector:@selector(boolValue)]) gSkipEmptyRefCert = [skip boolValue];
     if ([v isKindOfClass:[NSString class]] && v.length) wanted = v;
     else FZ(@"FckZck: no config found, using default version");
 
@@ -238,7 +243,7 @@ __attribute__((unused)) static void FZDumpClasses(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.4.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.5.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSString *frameworkPath = [bundlePath stringByAppendingPathComponent:@"Frameworks/SharedModules.framework/SharedModules"];
     MSImageRef image = MSGetImageByName([frameworkPath UTF8String]);
@@ -340,6 +345,38 @@ __attribute__((unused)) static void FZDumpClasses(void) {
 - (void)handlePairDeviceResponseWithDeviceJID:(id)jid companionProps:(id)companionProps retryTimestamp:(unsigned long long)ts serverError:(id)serverError {
     FZ(@"FckZck: PAIR response jid=%@ companionProps=%@ retryTimestamp=%llu serverError=%@",
        FZDesc(jid), FZDesc(companionProps), ts, FZDesc(serverError));
+    %orig;
+}
+
+%end
+
+%hook XMPPStanzaElement
+
+-(void)addChildWithName:(id)name dataValue:(id)data {
+    @try {
+        if ([name isKindOfClass:[NSString class]] && ([name isEqualToString:@"ref-cert"] || [name isEqualToString:@"client-props"])) {
+            NSUInteger len = [data isKindOfClass:[NSData class]] ? [(NSData *)data length] : 0;
+            NSString *hex = (len > 0 && len <= 4) ? [NSString stringWithFormat:@" bytes=%@", [(NSData *)data description]] : @"";
+            FZ(@"FckZck: addChildWithName %@ dataValue=%lu bytes%@", name, (unsigned long)len, hex);
+            if (len == 0 && gSkipEmptyRefCert && [name isEqualToString:@"ref-cert"]) {
+                FZ(@"FckZck: skipped empty ref-cert");
+                return;
+            }
+        }
+    } @catch (NSException *e) {}
+    %orig;
+}
+
+-(void)addChild:(id)child {
+    @try {
+        if (child) {
+            NSString *n = [(id<FZElem>)child name];
+            if ([n isEqualToString:@"ref-cert"] || [n isEqualToString:@"client-props"]) {
+                NSData *d = [(id<FZElem>)child dataValue];
+                FZ(@"FckZck: addChild %@ dataValue=%lu bytes (at add time)", n, (unsigned long)d.length);
+            }
+        }
+    } @catch (NSException *e) {}
     %orig;
 }
 
