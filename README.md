@@ -59,6 +59,14 @@ Causa (según `fckzck.log`): el servidor entrega INITIAL_BOOTSTRAP, pero en iOS 
 
 Qué hace 1.26: detecta INITIAL_BOOTSTRAP con `hasInitialHistBootstrapInlinePayload` (antes de procesarlo), completa los dos pasos del bootstrap a mano, tiene un temporizador de respaldo (`forceFinishBootstrapSeconds`, 25 s) y bloquea el logout de razón 11 como última red de seguridad (`blockHistoryTimeoutLogout`, ON por defecto).
 
+## 1.27 (historial no carga)
+
+El bootstrap ya termina, pero el teléfono nunca manda chunks RECENT/FULL: decide según la config de historial que el equipo vinculado declara **al vincular**. 1.27 registra y sube esos límites (`historyFullSyncDaysLimit`, `historyFullSyncSizeMbLimit`, `historyStorageQuotaMb`, `historyRecentSyncDaysLimit`, `historyRequireFullSync` en el plist) y vuelca las clases en `fckzck-pairing-classes.txt`. Hay que **desvincular y volver a vincular** para que surta efecto.
+
+## 1.28 (versión del bundle)
+
+Un usuario de Reddit reporta que el aviso "tu teléfono ya no es compatible" al enviar desaparece si pone la fecha del teléfono en abril de 2025. 1.28 hace que `CFBundleVersion` y `CFBundleShortVersionString` de WhatsApp (leídos con `NSBundle` y `CFBundleGetValueForInfoDictionaryKey`) devuelvan la versión falsa (`26.38.74` y `2.26.38.74`). Claves del plist: `spoofBundleVersion`, `bundleShortVersion`, `bundleVersion`. También vuelca clases con "Deprecat/Unsupported/OSVersion" en `fckzck-deprecation-classes.txt`.
+
 ## Known limitations
 
 - **Linking new devices does not work** on old WhatsApp builds, with this tweak or without it. Scanning a QR makes the server answer `400 bad-request`, and linking with a phone-number code fails on the phone with an AES-GCM decryption error. Both happen inside WhatsApp's own pairing code, which looks outdated compared to current companion clients. Changing the reported version does not seem to change this. Reports and ideas are welcome.

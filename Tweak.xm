@@ -930,9 +930,186 @@ static BOOL FZInstallSignalHooks(void) {
 }
 // -------------------------------------------------------------------------
 
+// ---- 1.28: spoof the app's own Info.plist version (CFBundleVersion / CFBundleShortVersionString) ----
+// Reddit report: "No puedes enviar mensajes porque tu teléfono ya no es compatible" disappears if the
+// phone date is set back to 6 Apr 2025. Some in-app checks read the version from the bundle's Info.plist
+// instead of the _WABuildVersion symbol, so make those report the spoofed version too.
+// plist keys: spoofBundleVersion (bool, default YES), bundleShortVersion (string, default = version,
+// e.g. 2.26.38.74), bundleVersion (string, default = last three parts, e.g. 26.38.74).
+static BOOL gSpoofBundle = YES;
+static NSString *gBundleShort = nil;
+static NSString *gBundleBuild = nil;
+
+static NSString *FZSpoofValueForKey(NSString *key) {
+    if (!gSpoofBundle || ![key isKindOfClass:[NSString class]]) return nil;
+    if ([key isEqualToString:@"CFBundleShortVersionString"]) return gBundleShort;
+    if ([key isEqualToString:@"CFBundleVersion"]) return gBundleBuild;
+    return nil;
+}
+
+static void FZLoadBundleSpoof(void) {
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.ifilipis.fckzck.plist"];
+    id sp = cfg[@"spoofBundleVersion"];
+    if ([sp respondsToSelector:@selector(boolValue)]) gSpoofBundle = [sp boolValue];
+    id sv = cfg[@"bundleShortVersion"];
+    id bv = cfg[@"bundleVersion"];
+    gBundleShort = ([sv isKindOfClass:[NSString class]] && [sv length]) ? sv : gVersion;
+    gBundleBuild = ([bv isKindOfClass:[NSString class]] && [bv length]) ? bv
+                   : [NSString stringWithFormat:@"%d.%d.%d", gNum[1], gNum[2], gNum[3]];
+    NSDictionary *real = [[NSBundle mainBundle] infoDictionary];
+    FZ(@"FckZck 1.28: bundle spoof=%d short=%@ build=%@ (real short=%@ build=%@)", gSpoofBundle, gBundleShort, gBundleBuild,
+       real[@"CFBundleShortVersionString"], real[@"CFBundleVersion"]);
+}
+
+static CFTypeRef (*orig_CFBundleGetValue)(CFBundleRef, CFStringRef);
+static CFTypeRef new_CFBundleGetValue(CFBundleRef b, CFStringRef key) {
+    CFTypeRef r = orig_CFBundleGetValue(b, key);
+    if (gSpoofBundle && key && b == CFBundleGetMainBundle()) {
+        NSString *v = FZSpoofValueForKey((__bridge NSString *)key);
+        if (v) return (__bridge CFTypeRef)v;
+    }
+    return r;
+}
+
+static void FZInstallBundleHooks(void) {
+    MSHookFunction((void *)CFBundleGetValueForInfoDictionaryKey, (void *)new_CFBundleGetValue, (void **)&orig_CFBundleGetValue);
+    FZ(@"FckZck 1.28: hooked CFBundleGetValueForInfoDictionaryKey");
+}
+
+%hook NSBundle
+
+- (id)objectForInfoDictionaryKey:(NSString *)key {
+    id r = %orig;
+    if (gSpoofBundle && self == [NSBundle mainBundle]) {
+        NSString *v = FZSpoofValueForKey(key);
+        if (v) return v;
+    }
+    return r;
+}
+
+- (NSDictionary *)infoDictionary {
+    NSDictionary *r = %orig;
+    if (gSpoofBundle && r && self == [NSBundle mainBundle]) {
+        static NSDictionary *cached = nil;
+        static NSDictionary *source = nil;
+        @synchronized ([NSBundle class]) {
+            if (source != r) {
+                NSMutableDictionary *m = [r mutableCopy];
+                if (gBundleShort) m[@"CFBundleShortVersionString"] = gBundleShort;
+                if (gBundleBuild) m[@"CFBundleVersion"] = gBundleBuild;
+                cached = [m copy];
+                source = r;
+            }
+            return cached;
+        }
+    }
+    return r;
+}
+
+%end
+// -------------------------------------------------------------------------
+
+// ---- 1.27: history-sync CONFIG declared to the primary phone at pairing -----------------
+// The primary only sends RECENT/FULL history chunks if the companion's DeviceProps.historySyncConfig
+// (declared while pairing) asks for them. Logs showed only BOOTSTRAP / STATUS / PUSH_NAME /
+// NON_BLOCKING_DATA arriving, never RECENT or FULL. These hooks log every setter on the
+// DeviceProps / HistorySyncConfig protobuf classes and raise the history limits.
+// plist keys (integers, 0 = leave WhatsApp's own value): historyFullSyncDaysLimit,
+// historyFullSyncSizeMbLimit, historyStorageQuotaMb, historyRecentSyncDaysLimit;
+// bool: historyRequireFullSync (default YES).
+static int gHsFullDays = 365, gHsFullMb = 4096, gHsQuotaMb = 4096, gHsRecentDays = 90;
+static BOOL gHsRequireFull = YES;
+
+#define FZ_UINT_SETTER(NAME, VAR) \
+static void (*orig_set##NAME)(id, SEL, unsigned int); \
+static void new_set##NAME(id self, SEL _cmd, unsigned int v) { \
+    unsigned int use = (VAR) > 0 ? (unsigned int)(VAR) : v; \
+    FZ(@"FckZck 1.27: %@.set%s %u -> %u", NSStringFromClass([self class]), #NAME, v, use); \
+    orig_set##NAME(self, _cmd, use); \
+}
+FZ_UINT_SETTER(FullSyncDaysLimit, gHsFullDays)
+FZ_UINT_SETTER(FullSyncSizeMbLimit, gHsFullMb)
+FZ_UINT_SETTER(StorageQuotaMb, gHsQuotaMb)
+FZ_UINT_SETTER(RecentSyncDaysLimit, gHsRecentDays)
+
+static void (*orig_setRequireFullSync)(id, SEL, BOOL);
+static void new_setRequireFullSync(id self, SEL _cmd, BOOL v) {
+    BOOL use = gHsRequireFull ? YES : v;
+    FZ(@"FckZck 1.27: %@.setRequireFullSync %d -> %d", NSStringFromClass([self class]), v, use);
+    orig_setRequireFullSync(self, _cmd, use);
+}
+
+static NSMutableSet *gPairHooked;
+static void FZLogSetters(Class c) {
+    unsigned int mc = 0;
+    Method *ms = class_copyMethodList(c, &mc);
+    NSMutableArray *names = [NSMutableArray array];
+    for (unsigned int j = 0; j < mc; j++) {
+        const char *n = sel_getName(method_getName(ms[j]));
+        if (strncmp(n, "set", 3) == 0) {
+            const char *enc = method_getTypeEncoding(ms[j]);
+            [names addObject:[NSString stringWithFormat:@"%s(%s)", n, enc ? enc : ""]];
+        }
+    }
+    free(ms);
+    FZ(@"FckZck 1.27: %s setters: %@", class_getName(c), [names componentsJoinedByString:@" "]);
+}
+
+static void FZInstallPairingHooks(void) {
+    if (!gPairHooked) gPairHooked = [NSMutableSet set];
+    unsigned int n = 0;
+    Class *classes = objc_copyClassList(&n);
+    for (unsigned int i = 0; i < n; i++) {
+        const char *cn = class_getName(classes[i]);
+        if (!cn) continue;
+        NSString *name = [NSString stringWithUTF8String:cn];
+        if (!name) continue;
+        if ([name rangeOfString:@"DeviceProps"].location == NSNotFound &&
+            [name rangeOfString:@"HistorySyncConfig"].location == NSNotFound) continue;
+        if ([gPairHooked containsObject:name]) continue;
+        [gPairHooked addObject:name];
+        Class c = classes[i];
+        FZLogSetters(c);
+        if (class_getInstanceMethod(c, sel_registerName("setFullSyncDaysLimit:")))
+            FZHookIfPresent(c, "setFullSyncDaysLimit:", "v20@0:8I16", (IMP)new_setFullSyncDaysLimit, (IMP *)&orig_setFullSyncDaysLimit);
+        if (class_getInstanceMethod(c, sel_registerName("setFullSyncSizeMbLimit:")))
+            FZHookIfPresent(c, "setFullSyncSizeMbLimit:", "v20@0:8I16", (IMP)new_setFullSyncSizeMbLimit, (IMP *)&orig_setFullSyncSizeMbLimit);
+        if (class_getInstanceMethod(c, sel_registerName("setStorageQuotaMb:")))
+            FZHookIfPresent(c, "setStorageQuotaMb:", "v20@0:8I16", (IMP)new_setStorageQuotaMb, (IMP *)&orig_setStorageQuotaMb);
+        if (class_getInstanceMethod(c, sel_registerName("setRecentSyncDaysLimit:")))
+            FZHookIfPresent(c, "setRecentSyncDaysLimit:", "v20@0:8I16", (IMP)new_setRecentSyncDaysLimit, (IMP *)&orig_setRecentSyncDaysLimit);
+        if (class_getInstanceMethod(c, sel_registerName("setRequireFullSync:")))
+            FZHookIfPresent(c, "setRequireFullSync:", "v20@0:8B16", (IMP)new_setRequireFullSync, (IMP *)&orig_setRequireFullSync);
+    }
+    free(classes);
+}
+
+static void FZLoadHistoryConfig(void) {
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.ifilipis.fckzck.plist"];
+    id v;
+    if ([(v = cfg[@"historyFullSyncDaysLimit"]) isKindOfClass:[NSNumber class]]) gHsFullDays = [v intValue];
+    if ([(v = cfg[@"historyFullSyncSizeMbLimit"]) isKindOfClass:[NSNumber class]]) gHsFullMb = [v intValue];
+    if ([(v = cfg[@"historyStorageQuotaMb"]) isKindOfClass:[NSNumber class]]) gHsQuotaMb = [v intValue];
+    if ([(v = cfg[@"historyRecentSyncDaysLimit"]) isKindOfClass:[NSNumber class]]) gHsRecentDays = [v intValue];
+    if ([(v = cfg[@"historyRequireFullSync"]) respondsToSelector:@selector(boolValue)]) gHsRequireFull = [v boolValue];
+    FZ(@"FckZck 1.27: history config fullDays=%d fullMb=%d quotaMb=%d recentDays=%d requireFull=%d",
+       gHsFullDays, gHsFullMb, gHsQuotaMb, gHsRecentDays, gHsRequireFull);
+}
+
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.26 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.28 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZLoadBundleSpoof();
+    FZInstallBundleHooks();
+    FZDumpClassesMatching(@[@"Deprecat", @"Unsupported", @"PlatformSupport", @"OSVersion", @"ExpiredBuild"],
+                          @"fckzck-deprecation-classes.txt");
+    FZLoadHistoryConfig();
+    FZInstallPairingHooks();
+    for (int d = 3; d <= 30; d += (d < 12 ? 3 : 9)) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)d * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ FZInstallPairingHooks(); });
+    }
+    FZDumpClassesMatching(@[@"DeviceProps", @"HistorySyncConfig", @"CompanionProps", @"PairDevice", @"DevicePairing"],
+                          @"fckzck-pairing-classes.txt");
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
