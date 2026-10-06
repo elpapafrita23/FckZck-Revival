@@ -9,19 +9,22 @@
 // Accepts "2.26.38.74" (4 parts) or "26.38.74" (3 parts, a leading 2 is added).
 // The build hash is always the MD5 of the version string.
 #define DEFAULT_VERSION @"2.26.38.74"
+// 1.21: authentication-first test. Keep the local deprecation bypass, but do not
+// spoof the version/build sent to WhatsApp unless explicitly enabled in the plist.
+static BOOL gVersionSpoof = NO;
 static NSString *gVersion = nil;
 static NSString *gHash = nil;
 static int gNum[4] = {2, 26, 38, 74};
 // Experiment: drop an EMPTY <ref-cert> node from the pair-device request.
 // Config key: <key>skipEmptyRefCert</key><true/> to turn it on.
-static NSString *gHistoryMode = @"continue";
+static NSString *gHistoryMode = @"stock";
 static NSNumber *gForceSyncState = nil;  // 1.20 diagnostic: observe the real UI state; do not force it.
 // Experiment (1.11): the app logs itself out ~120 s after pairing because history sync never
 // completes (reason "history_sync_timeout"). When ON, that single logout is swallowed and the
 // bootstrap is told the initial history sync finished instead.
 // Config keys: blockHistoryTimeoutLogout (bool, default ON),
 //              historyTimeoutRemovalReason (integer, default 11 = value seen in log 2).
-static BOOL gBlockHistoryTimeoutLogout = YES;  // 1.20 diagnostic: keep the companion alive at timeout so we can inspect the real state.
+static BOOL gBlockHistoryTimeoutLogout = NO;  // 1.21 auth-first: do not mask a server/auth failure with History Sync workarounds.
 // Experiment (1.12): force WASignalAddress "deprecated" for individual (non-group) sessions.
 // -1 = leave as is, 0 = force NO (default), 1 = force YES. Config key: signalDeprecatedOverride (integer).
 static int gDeprecatedOverride = 0;
@@ -47,8 +50,8 @@ static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping 
 // Experiment: OS version declared to the server in ClientPayload.UserAgent.
 // Config keys (strings): osVersion, osBuildNumber. An EMPTY osVersion disables
 // the override (the real iOS version is sent).
-static NSString *gOsVersion = @"15.8.3";
-static NSString *gOsBuild = @"19H386";
+static NSString *gOsVersion = nil;
+static NSString *gOsBuild = nil;
 
 // ---- File logging -------------------------------------------------------
 // Writes to <app Documents>/fckzck.log (and NSLog). Lets you read the log with
@@ -125,6 +128,9 @@ static void FZLoadConfig(void) {
     id ff = cfg[@"forceFinishBootstrapSeconds"];
     if ([ff isKindOfClass:[NSNumber class]]) gForceFinishSeconds = [ff intValue];
     FZ(@"FckZck: forceFinishBootstrapSeconds=%d", gForceFinishSeconds);
+    id vs = cfg[@"versionSpoof"];
+    if ([vs respondsToSelector:@selector(boolValue)]) gVersionSpoof = [vs boolValue];
+    FZ(@"FckZck: versionSpoof=%d", gVersionSpoof);
     id so = cfg[@"signalDeprecatedOverride"];
     if ([so isKindOfClass:[NSNumber class]]) gDeprecatedOverride = [so intValue];
     FZ(@"FckZck: signalDeprecatedOverride=%d", gDeprecatedOverride);
@@ -167,7 +173,7 @@ static void FZLoadConfig(void) {
     for (int i = 0; i < 4; i++) gNum[i] = nums[i];
     gVersion = [NSString stringWithFormat:@"%d.%d.%d.%d", nums[0], nums[1], nums[2], nums[3]];
     gHash = FZMD5(gVersion);
-    FZ(@"FckZck: spoofing version %@ (hash %@)", gVersion, gHash);
+    FZ(@"FckZck: configured app version %@ (hash %@), versionSpoof=%d", gVersion, gHash, gVersionSpoof);
 }
 
 
@@ -199,13 +205,13 @@ static NSDate *_new_WABuildDate() {
 }
 
 static NSString *_new_WABuildVersion(void *arg1, void *arg2) {
-    FZ(@"_new_WABuildVersion called");
-    return gVersion;
+    FZ(@"_new_WABuildVersion called -> %@", gVersion);
+    return gVersionSpoof ? gVersion : _orig_WABuildVersion(arg1, arg2);
 }
 
 static NSString *_new_WABuildHash() {
     FZ(@"_new_WABuildHash called");
-    return gHash;
+    return gVersionSpoof ? gHash : _orig_WABuildHash();
 }
 
 // The platform-deprecation check: the app asks "is this OS too old?" and,
@@ -869,7 +875,7 @@ static BOOL FZInstallSignalHooks(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.18.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.21 auth-history test loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -920,7 +926,7 @@ static BOOL FZInstallSignalHooks(void) {
 	static NSArray *keys;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
-		keys = @[@"md/", @"pair", @"link", @"companion", @"gcm", @"xmpp//", @"stream//", @"LL_E", @"LL_W", @"login", @"auth", @"deprecat", @"expire", @"version", @"signal", @"prekey", @"history-sync", @"logout"];
+		keys = @[@"md/", @"pair", @"link", @"companion", @"gcm", @"xmpp//", @"stream//", @"LL_E", @"LL_W", @"login", @"auth", @"deprecat", @"expire", @"version", @"signal", @"prekey", @"history-sync", @"logout", @"authenticate", @"401", @"not-authorized"];
 	});
 	for (NSString *k in keys) {
 		if ([result rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) {
