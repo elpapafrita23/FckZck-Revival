@@ -21,7 +21,10 @@ static NSNumber *gForceSyncState = nil;
 // bootstrap is told the initial history sync finished instead.
 // Config keys: blockHistoryTimeoutLogout (bool, default ON),
 //              historyTimeoutRemovalReason (integer, default 11 = value seen in log 2).
-static BOOL gBlockHistoryTimeoutLogout = YES;
+static BOOL gBlockHistoryTimeoutLogout = NO;  // 1.12: OFF. Log 3 showed it only leaves an endless spinner (server rejects the device with 401 on relaunch)
+// Experiment (1.12): force WASignalAddress "deprecated" for individual (non-group) sessions.
+// -1 = leave as is, 0 = force NO (default), 1 = force YES. Config key: signalDeprecatedOverride (integer).
+static int gDeprecatedOverride = 0;
 static long long gBlockLogoutReason = 11;
 static __weak id gBootObj = nil;
 static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping did not fix the 400)
@@ -43,6 +46,10 @@ static void FZLog(NSString *line) {
         queue = dispatch_queue_create("fckzck.log", DISPATCH_QUEUE_SERIAL);
         NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
         path = [[dirs firstObject] stringByAppendingPathComponent:@"fckzck.log"];
+        // keep the previous launch's log as fckzck-prev.log instead of wiping it
+        NSString *prev = [[dirs firstObject] stringByAppendingPathComponent:@"fckzck-prev.log"];
+        [[NSFileManager defaultManager] removeItemAtPath:prev error:nil];
+        [[NSFileManager defaultManager] moveItemAtPath:path toPath:prev error:nil];
         [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     });
     dispatch_async(queue, ^{
@@ -81,6 +88,9 @@ static void FZLoadConfig(void) {
     id br = cfg[@"historyTimeoutRemovalReason"];
     if ([br isKindOfClass:[NSNumber class]]) gBlockLogoutReason = [br longLongValue];
     FZ(@"FckZck: blockHistoryTimeoutLogout=%d reason=%lld", gBlockHistoryTimeoutLogout, gBlockLogoutReason);
+    id so = cfg[@"signalDeprecatedOverride"];
+    if ([so isKindOfClass:[NSNumber class]]) gDeprecatedOverride = [so intValue];
+    FZ(@"FckZck: signalDeprecatedOverride=%d", gDeprecatedOverride);
     id hm = cfg[@"historySyncFailureMode"];
     if ([hm isKindOfClass:[NSString class]] && [(NSString *)hm length]) gHistoryMode = hm;
     FZ(@"FckZck: historySyncFailureMode=%@", gHistoryMode);
@@ -478,16 +488,137 @@ static BOOL FZInstallHistoryHooks(void) {
 }
 // -------------------------------------------------------------------------
 
+// ---- Signal store diagnostics + deprecated-session experiment (1.12) -------
+// Log 2: the first two pkmsg from the primary were decrypted with sessions stored as
+// "deprecated=1"; the next four looked for "deprecated=0", found no session, then failed
+// with load_pre_key/missing (-1003). These hooks log every session/prekey access with the
+// address's deprecated flag, and (optionally) force that flag to NO for individual sessions.
+@protocol FZAddr <NSObject>
+- (BOOL)isDeprecated;
+@end
+
+static NSString *FZAddr(id a) {
+    if (!a) return @"nil";
+    BOOL dep = NO;
+    @try { dep = [(id<FZAddr>)a isDeprecated]; } @catch (NSException *e) {}
+    return [NSString stringWithFormat:@"%@ dep=%d", FZMask([NSString stringWithFormat:@"%@", a]), dep];
+}
+
+static id (*orig_addrInit1)(id, SEL, id, id, BOOL);
+static id new_addrInit1(id self, SEL _cmd, id jid, id gid, BOOL dep) {
+    BOOL use = (gid == nil && gDeprecatedOverride >= 0) ? (gDeprecatedOverride != 0) : dep;
+    FZ(@"FckZck: SignalAddress(jid=%@ group=%@) deprecated %d -> %d", FZMask([NSString stringWithFormat:@"%@", jid]), gid ? @"yes" : @"no", dep, use);
+    return orig_addrInit1(self, _cmd, jid, gid, use);
+}
+
+static id (*orig_addrInit2)(id, SEL, id, id, BOOL, id);
+static id new_addrInit2(id self, SEL _cmd, id jid, id gcjid, BOOL dep, id acct) {
+    BOOL use = (gcjid == nil && gDeprecatedOverride >= 0) ? (gDeprecatedOverride != 0) : dep;
+    FZ(@"FckZck: SignalAddress(jid=%@ groupCipher=%@) deprecated %d -> %d", FZMask([NSString stringWithFormat:@"%@", jid]), gcjid ? @"yes" : @"no", dep, use);
+    return orig_addrInit2(self, _cmd, jid, gcjid, use, acct);
+}
+
+static BOOL (*orig_storeSess)(id, SEL, id, id);
+static BOOL new_storeSess(id self, SEL _cmd, id rec, id addr) {
+    BOOL r = orig_storeSess(self, _cmd, rec, addr);
+    FZ(@"FckZck: KeyStore.storeSessionRecord addr=%@ -> %d", FZAddr(addr), r);
+    return r;
+}
+
+static id (*orig_getSess)(id, SEL, id);
+static id new_getSess(id self, SEL _cmd, id addr) {
+    id r = orig_getSess(self, _cmd, addr);
+    FZ(@"FckZck: KeyStore.sessionRecordForAddress addr=%@ -> %@", FZAddr(addr), r ? @"found" : @"MISSING");
+    return r;
+}
+
+static BOOL (*orig_hasSess)(id, SEL, id);
+static BOOL new_hasSess(id self, SEL _cmd, id addr) {
+    BOOL r = orig_hasSess(self, _cmd, addr);
+    FZ(@"FckZck: KeyStore.containsSessionForAddress addr=%@ -> %d", FZAddr(addr), r);
+    return r;
+}
+
+static id (*orig_getPre)(id, SEL, int);
+static id new_getPre(id self, SEL _cmd, int pid) {
+    id r = orig_getPre(self, _cmd, pid);
+    FZ(@"FckZck: KeyStore.fetchPreKeyRecordForId %d -> %@", pid, r ? @"found" : @"MISSING");
+    return r;
+}
+
+static BOOL (*orig_rmPre)(id, SEL, int);
+static BOOL new_rmPre(id self, SEL _cmd, int pid) {
+    BOOL r = orig_rmPre(self, _cmd, pid);
+    FZ(@"FckZck: KeyStore.removePreKeyRecordWithId %d -> %d", pid, r);
+    return r;
+}
+
+static BOOL (*orig_storePre)(id, SEL, id, int);
+static BOOL new_storePre(id self, SEL _cmd, id rec, int pid) {
+    BOOL r = orig_storePre(self, _cmd, rec, pid);
+    FZ(@"FckZck: KeyStore.storePreKeyRecord id=%d -> %d", pid, r);
+    return r;
+}
+
+static int (*orig_decPre)(id, SEL, id, id, void *, BOOL);
+static int new_decPre(id self, SEL _cmd, id data, id addr, void *out, BOOL stateless) {
+    int r = orig_decPre(self, _cmd, data, addr, out, stateless);
+    FZ(@"FckZck: Coordinator.decryptPreKeyCiphertext len=%lu addr=%@ stateless=%d -> %d",
+       (unsigned long)[(NSData *)data length], FZAddr(addr), stateless, r);
+    return r;
+}
+
+static int (*orig_decReg)(id, SEL, id, id, void *);
+static int new_decReg(id self, SEL _cmd, id data, id addr, void *out) {
+    int r = orig_decReg(self, _cmd, data, addr, out);
+    FZ(@"FckZck: Coordinator.decryptRegularCiphertext len=%lu addr=%@ -> %d",
+       (unsigned long)[(NSData *)data length], FZAddr(addr), r);
+    return r;
+}
+
+static BOOL gSignalHooked = NO;
+static BOOL FZInstallSignalHooks(void) {
+    if (gSignalHooked) return YES;
+    Class ad = objc_getClass("WASignalAddress");
+    Class ks = objc_getClass("WASignalKeyStore");
+    Class co = objc_getClass("WASignalCoordinator");
+    if (!ad && !ks && !co) return NO;
+    if (ad) {
+        FZHookIfPresent(ad, "initWithDeviceJID:groupID:deprecated:", "@36@0:8@16@24B32", (IMP)new_addrInit1, (IMP *)&orig_addrInit1);
+        FZHookIfPresent(ad, "initWithDeviceJID:groupCipherJID:deprecated:accountProvider:", "@44@0:8@16@24B32@36", (IMP)new_addrInit2, (IMP *)&orig_addrInit2);
+    } else FZ(@"FckZck: WASignalAddress not found");
+    if (ks) {
+        FZHookIfPresent(ks, "storeSessionRecord:forAddress:", "B32@0:8@16@24", (IMP)new_storeSess, (IMP *)&orig_storeSess);
+        FZHookIfPresent(ks, "sessionRecordForAddress:", "@24@0:8@16", (IMP)new_getSess, (IMP *)&orig_getSess);
+        FZHookIfPresent(ks, "containsSessionForAddress:", "B24@0:8@16", (IMP)new_hasSess, (IMP *)&orig_hasSess);
+        FZHookIfPresent(ks, "fetchPreKeyRecordForId:", "@20@0:8i16", (IMP)new_getPre, (IMP *)&orig_getPre);
+        FZHookIfPresent(ks, "removePreKeyRecordWithId:", "B20@0:8i16", (IMP)new_rmPre, (IMP *)&orig_rmPre);
+        FZHookIfPresent(ks, "storePreKeyRecord:id:", "B28@0:8@16i24", (IMP)new_storePre, (IMP *)&orig_storePre);
+    } else FZ(@"FckZck: WASignalKeyStore not found");
+    if (co) {
+        FZHookIfPresent(co, "decryptPreKeyCiphertextData:forSignalAddress:plaintextData:statelessly:", "i44@0:8@16@24o^@32B40", (IMP)new_decPre, (IMP *)&orig_decPre);
+        FZHookIfPresent(co, "decryptRegularCiphertextData:forSignalAddress:plaintextData:", "i40@0:8@16@24o^@32", (IMP)new_decReg, (IMP *)&orig_decReg);
+    } else FZ(@"FckZck: WASignalCoordinator not found");
+    gSignalHooked = YES;
+    return YES;
+}
+// -------------------------------------------------------------------------
+
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.11.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.12.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!FZInstallUserAgentHooks()) FZ(@"FckZck: WAPBClientPayload_UserAgent still not found");
         });
     }
-    FZDumpClassesMatching(@[@"Signal", @"PreKey", @"Prekey", @"Session", @"Encrypt", @"Decrypt", @"IdentityKey", @"Keychain"], @"fckzck-classes3.txt");
+    // class dump disabled in 1.12 (classes3 already captured); re-enable FZDumpClassesMatching(...) if needed
+    if (!FZInstallSignalHooks()) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!FZInstallSignalHooks()) FZ(@"FckZck: signal classes still not found");
+        });
+    }
     if (!FZInstallHistoryHooks()) {
         FZ(@"FckZck: history-sync classes not found yet, retrying in 3s and 10s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
