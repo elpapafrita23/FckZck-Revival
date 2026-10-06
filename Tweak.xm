@@ -30,6 +30,8 @@ static int gDeprecatedOverride = 0;
 // Config key: forceFinishBootstrapSeconds (integer).
 static int gForceFinishSeconds = 40;
 static BOOL gInitialCalled = NO;
+static BOOL gSecCalled = NO;
+static __weak id gHistSvc = nil;
 static BOOL gForceScheduled = NO;
 static long long gBlockLogoutReason = 11;
 static __weak id gBootObj = nil;
@@ -397,6 +399,7 @@ static void new_hsFailure(id self, SEL _cmd, id reason) {
 
 static void (*orig_hsHandle)(id, SEL, id, id);
 static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
+    gHistSvc = self;
     @try {
         NSMutableString *line = [NSMutableString stringWithFormat:@"FckZck: HistorySyncService.handleMessage class=%@", NSStringFromClass([msg class])];
         NSArray *paths = @[@"type",
@@ -452,6 +455,44 @@ static BOOL FZHookIfPresent(Class c, const char *selName, const char *wantEnc, I
 
 // Remember the live CompanionBootstrapLoading object (it is called during pairing,
 // well before the 120 s timeout fires).
+@protocol FZSvc <NSObject>
+- (BOOL)isInitialSyncFinished;
+@end
+
+// WAHistorySyncCompanionService: ObjC surface seen in log 5 (everything else is Swift).
+static BOOL (*orig_isInit)(id, SEL);
+static BOOL new_isInit(id self, SEL _cmd) {
+    BOOL r = orig_isInit(self, _cmd);
+    static int last = -1;
+    if (last != (int)r) { last = (int)r; FZ(@"FckZck: HistorySyncCompanionService.isInitialSyncFinished -> %d", r); }
+    return r;
+}
+static void (*orig_runWhen)(id, SEL, id);
+static void new_runWhen(id self, SEL _cmd, id blk) {
+    FZ(@"FckZck: HistorySyncCompanionService.runWhenInitialSyncFinished: called (block=%@)", blk ? @"yes" : @"nil");
+    orig_runWhen(self, _cmd, blk);
+}
+static void (*orig_didUpdAB)(id, SEL);
+static void new_didUpdAB(id self, SEL _cmd) {
+    FZ(@"FckZck: HistorySyncCompanionService.didUpdateABProperties");
+    orig_didUpdAB(self, _cmd);
+}
+static void (*orig_resumeBg)(id, SEL);
+static void new_resumeBg(id self, SEL _cmd) {
+    FZ(@"FckZck: HistorySyncCompanionService.resumeFromBackground");
+    orig_resumeBg(self, _cmd);
+}
+
+// CompanionBootstrapLoading waits for several steps. Log 6 showed criticalBlock, criticalUnblockLow
+// and (forced) initialSync, but never handleSecurityNotificationSetting -- the primary normally
+// delivers that through history sync, which never gets processed here.
+static void (*orig_hsSec)(id, SEL);
+static void new_hsSec(id self, SEL _cmd) {
+    FZ(@"FckZck: CompanionBootstrapLoading.handleSecurityNotificationSetting called");
+    gSecCalled = YES;
+    orig_hsSec(self, _cmd);
+}
+
 static void (*orig_critBlock)(id, SEL, id);
 static void new_critBlock(id self, SEL _cmd, id arg) {
     gBootObj = self;
@@ -460,11 +501,21 @@ static void new_critBlock(id self, SEL _cmd, id arg) {
         FZ(@"FckZck: bootstrap object captured, will force-finish in %d s if still loading", gForceFinishSeconds);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)gForceFinishSeconds * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
             id boot = gBootObj;
-            if (gInitialCalled) { FZ(@"FckZck: force-finish not needed, initial history sync already reported"); return; }
+            if (gInitialCalled && gSecCalled) { FZ(@"FckZck: force-finish not needed, bootstrap steps already reported"); return; }
             if (boot && orig_hsInitial) {
-                FZ(@"FckZck: force-finish: calling handleInitialHistorySync");
-                gInitialCalled = YES;
-                orig_hsInitial(boot, sel_registerName("handleInitialHistorySync"));
+                id svc = gHistSvc;
+                FZ(@"FckZck: force-finish: service=%@ isInitialSyncFinished(before)=%d", svc ? @"yes" : @"nil", svc ? (int)[(id<FZSvc>)svc isInitialSyncFinished] : -1);
+                if (!gInitialCalled) {
+                    FZ(@"FckZck: force-finish: calling handleInitialHistorySync");
+                    gInitialCalled = YES;
+                    orig_hsInitial(boot, sel_registerName("handleInitialHistorySync"));
+                }
+                if (!gSecCalled && orig_hsSec) {
+                    FZ(@"FckZck: force-finish: calling handleSecurityNotificationSetting");
+                    gSecCalled = YES;
+                    orig_hsSec(boot, sel_registerName("handleSecurityNotificationSetting"));
+                }
+                if (svc) FZ(@"FckZck: force-finish: isInitialSyncFinished(after)=%d", (int)[(id<FZSvc>)svc isInitialSyncFinished]);
             } else FZ(@"FckZck: force-finish: no bootstrap object");
         });
     }
@@ -520,8 +571,15 @@ static BOOL FZInstallHistoryHooks(void) {
         FZHookIfPresent(boot, "handleInitialHistorySync", "v16@0:8", (IMP)new_hsInitial, (IMP *)&orig_hsInitial);
         FZHookIfPresent(boot, "handleHistorySyncFailure:", "v24@0:8@16", (IMP)new_hsFailure, (IMP *)&orig_hsFailure);
         FZHookIfPresent(boot, "handleSyncdCriticalBlockCollection:", "v24@0:8@16", (IMP)new_critBlock, (IMP *)&orig_critBlock);
+        FZHookIfPresent(boot, "handleSecurityNotificationSetting", "v16@0:8", (IMP)new_hsSec, (IMP *)&orig_hsSec);
     } else FZ(@"FckZck: CompanionBootstrapLoading not found");
-    if (svc) FZHookIfPresent(svc, "handleMessage:stanza:", "v32@0:8@16@24", (IMP)new_hsHandle, (IMP *)&orig_hsHandle);
+    if (svc) {
+        FZHookIfPresent(svc, "handleMessage:stanza:", "v32@0:8@16@24", (IMP)new_hsHandle, (IMP *)&orig_hsHandle);
+        FZHookIfPresent(svc, "isInitialSyncFinished", "B16@0:8", (IMP)new_isInit, (IMP *)&orig_isInit);
+        FZHookIfPresent(svc, "runWhenInitialSyncFinished:", "v24@0:8@?16", (IMP)new_runWhen, (IMP *)&orig_runWhen);
+        FZHookIfPresent(svc, "didUpdateABProperties", "v16@0:8", (IMP)new_didUpdAB, (IMP *)&orig_didUpdAB);
+        FZHookIfPresent(svc, "resumeFromBackground", "v16@0:8", (IMP)new_resumeBg, (IMP *)&orig_resumeBg);
+    }
     else FZ(@"FckZck: WAHistorySyncCompanionService not found");
     if (lgr) FZHookIfPresent(lgr, "handlePreKeysUploadFail:", "v24@0:8@16", (IMP)new_preKeyFail, (IMP *)&orig_preKeyFail);
     gHistoryHooksDone = YES;
@@ -647,7 +705,7 @@ static BOOL FZInstallSignalHooks(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.13.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.15.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
