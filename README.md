@@ -95,3 +95,11 @@ This is an unofficial project. It is not affiliated with, endorsed by, or connec
 
 - **ifilipis**, original author of FckZck.
 - **0xkuj**, author of blockWAUpdates, which the original project builds on.
+
+
+## FckZck 1.27.1 history import fix
+- Based on the uploaded 1.26 source.
+- Removed premature INITIAL_BOOTSTRAP completion.
+- `runWhenInitialSyncFinished:` now forwards to WhatsApp's original implementation.
+- Disabled the bootstrap completion timer.
+- The history timeout logout is blocked only for diagnostics and is never converted into a fake successful history completion.
