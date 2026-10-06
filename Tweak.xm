@@ -242,7 +242,7 @@ static void FZDumpElem(id<FZElem> e, int depth, NSMutableString *out) {
 // 20 s after launch, writes the names + method selectors + type encodings of
 // every class related to pairing / companion / ADV / stanzas to
 // <app Documents>/fckzck-classes.txt. Only in the main WhatsApp apps.
-static void FZDumpClassesMatching(NSArray *pats, NSString *fname) {
+__attribute__((unused)) static void FZDumpClassesMatching(NSArray *pats, NSString *fname) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     if (![bid isEqualToString:@"net.whatsapp.WhatsApp"] && ![bid isEqualToString:@"net.whatsapp.WhatsAppSMB"]) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
