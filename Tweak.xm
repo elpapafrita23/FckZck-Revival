@@ -25,6 +25,12 @@ static BOOL gBlockHistoryTimeoutLogout = NO;  // 1.12: OFF. Log 3 showed it only
 // Experiment (1.12): force WASignalAddress "deprecated" for individual (non-group) sessions.
 // -1 = leave as is, 0 = force NO (default), 1 = force YES. Config key: signalDeprecatedOverride (integer).
 static int gDeprecatedOverride = 0;
+// Experiment (1.13): if the bootstrap ("loading your chats") has not been told that the initial
+// history sync finished N seconds after pairing, tell it ourselves. 0 = off.
+// Config key: forceFinishBootstrapSeconds (integer).
+static int gForceFinishSeconds = 40;
+static BOOL gInitialCalled = NO;
+static BOOL gForceScheduled = NO;
 static long long gBlockLogoutReason = 11;
 static __weak id gBootObj = nil;
 static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping did not fix the 400)
@@ -46,10 +52,28 @@ static void FZLog(NSString *line) {
         queue = dispatch_queue_create("fckzck.log", DISPATCH_QUEUE_SERIAL);
         NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
         path = [[dirs firstObject] stringByAppendingPathComponent:@"fckzck.log"];
-        // keep the previous launch's log as fckzck-prev.log instead of wiping it
-        NSString *prev = [[dirs firstObject] stringByAppendingPathComponent:@"fckzck-prev.log"];
-        [[NSFileManager defaultManager] removeItemAtPath:prev error:nil];
-        [[NSFileManager defaultManager] moveItemAtPath:path toPath:prev error:nil];
+        // keep the last launches as fckzck-<yyyyMMdd-HHmmss>.log (newest 6) instead of wiping the log
+        NSString *dir = [dirs firstObject];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm removeItemAtPath:[dir stringByAppendingPathComponent:@"fckzck-prev.log"] error:nil];
+        if ([fm fileExistsAtPath:path]) {
+            NSDate *m = [[fm attributesOfItemAtPath:path error:nil] fileModificationDate];
+            if (!m) m = [NSDate date];
+            NSDateFormatter *df = [[NSDateFormatter alloc] init];
+            df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+            df.dateFormat = @"yyyyMMdd-HHmmss";
+            NSString *arch = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"fckzck-%@.log", [df stringFromDate:m]]];
+            [fm moveItemAtPath:path toPath:arch error:nil];
+        }
+        NSMutableArray *olds = [NSMutableArray array];
+        for (NSString *f in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+            if ([f hasPrefix:@"fckzck-2"] && [f hasSuffix:@".log"]) [olds addObject:f];
+        }
+        [olds sortUsingSelector:@selector(compare:)];
+        while (olds.count > 6) {
+            [fm removeItemAtPath:[dir stringByAppendingPathComponent:olds.firstObject] error:nil];
+            [olds removeObjectAtIndex:0];
+        }
         [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     });
     dispatch_async(queue, ^{
@@ -88,6 +112,9 @@ static void FZLoadConfig(void) {
     id br = cfg[@"historyTimeoutRemovalReason"];
     if ([br isKindOfClass:[NSNumber class]]) gBlockLogoutReason = [br longLongValue];
     FZ(@"FckZck: blockHistoryTimeoutLogout=%d reason=%lld", gBlockHistoryTimeoutLogout, gBlockLogoutReason);
+    id ff = cfg[@"forceFinishBootstrapSeconds"];
+    if ([ff isKindOfClass:[NSNumber class]]) gForceFinishSeconds = [ff intValue];
+    FZ(@"FckZck: forceFinishBootstrapSeconds=%d", gForceFinishSeconds);
     id so = cfg[@"signalDeprecatedOverride"];
     if ([so isKindOfClass:[NSNumber class]]) gDeprecatedOverride = [so intValue];
     FZ(@"FckZck: signalDeprecatedOverride=%d", gDeprecatedOverride);
@@ -352,6 +379,7 @@ static BOOL FZInstallUserAgentHooks(void) {
 static void (*orig_hsInitial)(id, SEL);
 static void new_hsInitial(id self, SEL _cmd) {
     FZ(@"FckZck: CompanionBootstrapLoading.handleInitialHistorySync called");
+    gInitialCalled = YES;
     orig_hsInitial(self, _cmd);
 }
 
@@ -427,6 +455,19 @@ static BOOL FZHookIfPresent(Class c, const char *selName, const char *wantEnc, I
 static void (*orig_critBlock)(id, SEL, id);
 static void new_critBlock(id self, SEL _cmd, id arg) {
     gBootObj = self;
+    if (gForceFinishSeconds > 0 && !gForceScheduled) {
+        gForceScheduled = YES;
+        FZ(@"FckZck: bootstrap object captured, will force-finish in %d s if still loading", gForceFinishSeconds);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)gForceFinishSeconds * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            id boot = gBootObj;
+            if (gInitialCalled) { FZ(@"FckZck: force-finish not needed, initial history sync already reported"); return; }
+            if (boot && orig_hsInitial) {
+                FZ(@"FckZck: force-finish: calling handleInitialHistorySync");
+                gInitialCalled = YES;
+                orig_hsInitial(boot, sel_registerName("handleInitialHistorySync"));
+            } else FZ(@"FckZck: force-finish: no bootstrap object");
+        });
+    }
     orig_critBlock(self, _cmd, arg);
 }
 
@@ -507,14 +548,14 @@ static NSString *FZAddr(id a) {
 static id (*orig_addrInit1)(id, SEL, id, id, BOOL);
 static id new_addrInit1(id self, SEL _cmd, id jid, id gid, BOOL dep) {
     BOOL use = (gid == nil && gDeprecatedOverride >= 0) ? (gDeprecatedOverride != 0) : dep;
-    FZ(@"FckZck: SignalAddress(jid=%@ group=%@) deprecated %d -> %d", FZMask([NSString stringWithFormat:@"%@", jid]), gid ? @"yes" : @"no", dep, use);
+    if (dep != use) FZ(@"FckZck: SignalAddress(jid=%@ group=%@) deprecated %d -> %d", FZMask([NSString stringWithFormat:@"%@", jid]), gid ? @"yes" : @"no", dep, use);
     return orig_addrInit1(self, _cmd, jid, gid, use);
 }
 
 static id (*orig_addrInit2)(id, SEL, id, id, BOOL, id);
 static id new_addrInit2(id self, SEL _cmd, id jid, id gcjid, BOOL dep, id acct) {
     BOOL use = (gcjid == nil && gDeprecatedOverride >= 0) ? (gDeprecatedOverride != 0) : dep;
-    FZ(@"FckZck: SignalAddress(jid=%@ groupCipher=%@) deprecated %d -> %d", FZMask([NSString stringWithFormat:@"%@", jid]), gcjid ? @"yes" : @"no", dep, use);
+    if (dep != use) FZ(@"FckZck: SignalAddress(jid=%@ groupCipher=%@) deprecated %d -> %d", FZMask([NSString stringWithFormat:@"%@", jid]), gcjid ? @"yes" : @"no", dep, use);
     return orig_addrInit2(self, _cmd, jid, gcjid, use, acct);
 }
 
@@ -606,7 +647,7 @@ static BOOL FZInstallSignalHooks(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.12.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.13.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
