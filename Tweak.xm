@@ -2,6 +2,11 @@
 #include <substrate.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <malloc/malloc.h>
+#include <stdlib.h>
 
 // ---- Configurable version ----------------------------------------------
 // Read from /var/mobile/Library/Preferences/com.ifilipis.fckzck.plist
@@ -1240,6 +1245,135 @@ static void FZInstallTraceHooks(void) {
     });
 }
 
+// ---- 1.28: hook the exported SharedModules payload builder (WACreateClientPayload) ------
+// Log 6 stack: the ClientPayload is built by the C function WACreateClientPayload in SharedModules
+// (called from _WCCConnectionDefaultDoConnectWithAuthKeys), not through GPBMessage serialization.
+// We hook it by name; the return value is validated before touching it. If it is serialized
+// ClientPayload bytes (NSData), field 19 (devicePairingData) -> field 8 (companionProps / DeviceProps)
+// is rewritten with the spoofed version + full-history request.
+static int FZCmpU(const void *a, const void *b) { uintptr_t x = *(const uintptr_t *)a, y = *(const uintptr_t *)b; return x < y ? -1 : (x > y); }
+static BOOL FZIsObjC(void *r) {
+    uintptr_t v = (uintptr_t)r;
+    if (v < 0x100000000ULL || (v & 7) || (v >> 40)) return NO;
+    if (malloc_size(r) < 16) return NO;
+    uintptr_t cls = (*(uintptr_t *)r) & 0x0000000ffffffff8ULL;
+    unsigned int n = 0;
+    Class *cl = objc_copyClassList(&n);
+    uintptr_t *arr = (uintptr_t *)malloc(sizeof(uintptr_t) * (n ? n : 1));
+    for (unsigned int i = 0; i < n; i++) arr[i] = (uintptr_t)cl[i];
+    free(cl);
+    qsort(arr, n, sizeof(uintptr_t), FZCmpU);
+    BOOL ok = bsearch(&cls, arr, n, sizeof(uintptr_t), FZCmpU) != NULL;
+    free(arr);
+    return ok;
+}
+
+static NSData *FZTuneClientPayloadBytes(NSData *in) {
+    @try {
+        NSMutableArray *f = FZPBParse(in);
+        if (!f) { FZ(@"FckZck 1.28: payload bytes (%lu) are not protobuf, untouched", (unsigned long)in.length); return in; }
+        NSData *reg = FZPBGet(f, 19);
+        FZ(@"FckZck 1.28: ClientPayload %lu bytes, %lu fields, devicePairingData(19) %@", (unsigned long)in.length, (unsigned long)f.count, reg ? @"present" : @"absent");
+        if (!reg) return in;
+        NSMutableArray *sub = FZPBParse(reg);
+        if (!sub) return in;
+        uint64_t fid = 8;
+        NSData *props = FZPBGet(sub, 8);
+        if (!props) {
+            for (NSDictionary *e in sub) {   // fallback: any length-delimited field that parses like DeviceProps
+                if ([e[@"w"] intValue] != 2) continue;
+                NSMutableArray *t = FZPBParse(e[@"v"]);
+                if (t && FZPBGet(t, 2) && FZPBGet(t, 1)) { props = e[@"v"]; fid = [e[@"f"] unsignedLongLongValue]; break; }
+            }
+        }
+        if (!props) { FZ(@"FckZck 1.28: no companionProps inside devicePairingData"); return in; }
+        NSData *np = FZTuneDevicePropsData(props);
+        if ([np isEqualToData:props]) return in;
+        FZPBSet(sub, fid, 2, np);
+        FZPBSet(f, 19, 2, FZPBSerialize(sub));
+        NSData *out = FZPBSerialize(f);
+        FZ(@"FckZck 1.28: ClientPayload rewritten %lu -> %lu bytes", (unsigned long)in.length, (unsigned long)out.length);
+        return out;
+    } @catch (NSException *e) { FZ(@"FckZck 1.28: payload rewrite exception %@", e); return in; }
+}
+
+static void *FZHandlePayloadResult(void *r, const char *tag) {
+    if (!FZIsObjC(r)) { FZ(@"FckZck 1.28: %s returned %p (not an ObjC object), untouched", tag, r); return r; }
+    id o = (__bridge id)r;
+    FZ(@"FckZck 1.28: %s returned %s", tag, object_getClassName(o));
+    @try {
+        if ([o isKindOfClass:[NSData class]]) {
+            NSData *d = (NSData *)o;
+            NSData *n = FZTuneClientPayloadBytes(d);
+            if (n && ![n isEqualToData:d]) {
+                if ([o isKindOfClass:[NSMutableData class]]) { [(NSMutableData *)o setData:n]; FZ(@"FckZck 1.28: payload patched in place"); }
+                else { FZ(@"FckZck 1.28: payload replaced"); return (void *)CFBridgingRetain([NSData dataWithData:n]); }  // original leaked on purpose (ownership unknown)
+            }
+        } else if ([o isKindOfClass:objc_getClass("WAPBClientPayload")]) {
+            FZTunePayload(o);
+        }
+    } @catch (NSException *e) { FZ(@"FckZck 1.28: handle exception %@", e); }
+    return r;
+}
+
+typedef void *(*FZFn8)(void *, void *, void *, void *, void *, void *, void *, void *);
+#define FZ_PAYFN(N) \
+static FZFn8 orig_pf##N; \
+static void *new_pf##N(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) { \
+    void *r = orig_pf##N(a, b, c, d, e, f, g, h); \
+    return FZHandlePayloadResult(r, "payloadFn" #N); }
+FZ_PAYFN(0) FZ_PAYFN(1) FZ_PAYFN(2)
+
+static NSArray *FZSymbols(const struct mach_header_64 *mh) {
+    intptr_t slide = 0;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++)
+        if ((const void *)_dyld_get_image_header(i) == (const void *)mh) { slide = _dyld_get_image_vmaddr_slide(i); break; }
+    const uint8_t *p = (const uint8_t *)(mh + 1);
+    struct symtab_command *st = NULL; struct segment_command_64 *le = NULL;
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        struct load_command *lc = (struct load_command *)p;
+        if (lc->cmd == LC_SYMTAB) st = (struct symtab_command *)lc;
+        else if (lc->cmd == LC_SEGMENT_64) { struct segment_command_64 *sc = (struct segment_command_64 *)lc; if (strcmp(sc->segname, "__LINKEDIT") == 0) le = sc; }
+        p += lc->cmdsize;
+    }
+    NSMutableArray *out = [NSMutableArray array];
+    if (!st || !le) return out;
+    uintptr_t base = (uintptr_t)le->vmaddr + slide - le->fileoff;
+    struct nlist_64 *nl = (struct nlist_64 *)(base + st->symoff);
+    const char *str = (const char *)(base + st->stroff);
+    for (uint32_t i = 0; i < st->nsyms; i++) {
+        if ((nl[i].n_type & N_TYPE) != N_SECT) continue;
+        const char *nm = str + nl[i].n_strx;
+        if (nm[0]) [out addObject:@(nm)];
+    }
+    return out;
+}
+
+static void FZInstallPayloadFnHooks(MSImageRef image) {
+    NSArray *syms = FZSymbols((const struct mach_header_64 *)image);
+    FZ(@"FckZck 1.28: SharedModules exports %lu symbols", (unsigned long)syms.count);
+    NSMutableArray *cand = [NSMutableArray array];
+    int logged = 0;
+    for (NSString *n in syms) {
+        NSString *l = [n lowercaseString];
+        if (logged < 120 && ([l containsString:@"payload"] || [l containsString:@"companion"] || [l containsString:@"deviceprops"] || [l containsString:@"regdata"] || [l containsString:@"noise"] || [l containsString:@"handshake"])) { FZ(@"FckZck 1.28: sym %@", n); logged++; }
+        if ([n hasPrefix:@"_WACreate"] && [l containsString:@"payload"] && ![cand containsObject:n]) [cand addObject:n];
+    }
+    int k = 0;
+    for (NSString *n in cand) {
+        if (k >= 3) break;
+        const char *c = [n UTF8String];
+        void *sym = MSFindSymbol(image, c);
+        if (!sym) continue;
+        if (k == 0) MSHookFunction(sym, (void *)new_pf0, (void **)&orig_pf0);
+        else if (k == 1) MSHookFunction(sym, (void *)new_pf1, (void **)&orig_pf1);
+        else MSHookFunction(sym, (void *)new_pf2, (void **)&orig_pf2);
+        FZ(@"FckZck 1.28: hooked payload builder %s as payloadFn%d", c, k);
+        k++;
+    }
+    if (!k) FZ(@"FckZck 1.28: no WACreate*Payload* export found");
+}
+
 static int gPropsHooks = 0;
 static NSMutableSet *gPropsSeen;
 static void FZScanDeviceProps(void) {
@@ -1281,7 +1415,7 @@ static void FZScanLoop(int left) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.27.4 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.28 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1325,6 +1459,7 @@ static void FZScanLoop(int left) {
     hookSymbol(image, "_WADeprecatedPlatformCutOffDate", (void *)&_new_WADeprecatedPlatformCutOffDate, (void **)&_orig_WADeprecatedPlatformCutOffDate);
     hookSymbol(image, "_WAIsPlatformDeprecated", (void *)&_new_WAIsPlatformDeprecated, (void **)&_orig_WAIsPlatformDeprecated);
     hookSymbol(image, "_WAShouldShowPlatformDeprecationNags", (void *)&_new_WAShouldShowPlatformDeprecationNags, (void **)&_orig_WAShouldShowPlatformDeprecationNags);
+    FZInstallPayloadFnHooks(image);
 }
 
 %hook WALogWriter
