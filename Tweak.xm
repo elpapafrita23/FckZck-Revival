@@ -351,6 +351,11 @@ static void new_setOsBuildNumber(id self, SEL _cmd, id v) {
 static void (*orig_setDevice)(id, SEL, id);
 static void new_setDevice(id self, SEL _cmd, id v) {
     FZ(@"FckZck: UserAgent.setDevice(%@)", v);
+    static int stackN = 0;
+    if (stackN++ < 3) {
+        NSArray *st = [NSThread callStackSymbols];
+        for (NSUInteger i = 0; i < st.count && i < 30; i++) FZ(@"FckZck 1.27: STACK#%d %@", stackN, st[i]);
+    }
     orig_setDevice(self, _cmd, v);
 }
 
