@@ -1,0 +1,9 @@
+Package: com.ifilipis.fckzck
+Name: FckZck
+Depends: mobilesubstrate
+Version: 1.29.0
+Architecture: iphoneos-arm
+Description: Keeps WhatsApp working on old iOS: spoofs the app version and disables the forced-update and deprecated-platform checks
+Maintainer: Fabian (continuation of ifilipis' FckZck)
+Author: ifilipis
+Section: Tweaks

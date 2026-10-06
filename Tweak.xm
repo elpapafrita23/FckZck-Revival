@@ -47,6 +47,7 @@ static id gBootObj = nil;               // 1.26: strong ref so it cannot vanish 
 static BOOL gBootstrapSeen = NO;
 static BOOL gFinishRunning = NO;
 static int gFinishTries = 0;
+static BOOL gSkipClientProps = NO;   // 1.29 experiment: drop <client-props> from pair-device (plist skipClientProps)
 static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping did not fix the 400)
 // Experiment: OS version declared to the server in ClientPayload.UserAgent.
 // Config keys (strings): osVersion, osBuildNumber. An EMPTY osVersion disables
@@ -121,6 +122,9 @@ static void FZLoadConfig(void) {
     NSString *v = cfg[@"version"];
     id skip = cfg[@"skipEmptyRefCert"];
     if ([skip respondsToSelector:@selector(boolValue)]) gSkipEmptyRefCert = [skip boolValue];
+    id skc = cfg[@"skipClientProps"];
+    if ([skc respondsToSelector:@selector(boolValue)]) gSkipClientProps = [skc boolValue];
+    FZ(@"FckZck 1.29: skipEmptyRefCert=%d skipClientProps=%d", gSkipEmptyRefCert, gSkipClientProps);
     // 1.26: the 120 s history_sync_timeout logout is blocked by default (plist key
     // blockHistoryTimeoutLogout can turn it off) and the bootstrap is completed by hand.
     gBlockHistoryTimeoutLogout = YES;
@@ -1098,7 +1102,7 @@ static void FZLoadHistoryConfig(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.28 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.29 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     FZLoadBundleSpoof();
     FZInstallBundleHooks();
     FZDumpClassesMatching(@[@"Deprecat", @"Unsupported", @"PlatformSupport", @"OSVersion", @"ExpiredBuild"],
@@ -1108,7 +1112,7 @@ static void FZLoadHistoryConfig(void) {
     for (int d = 3; d <= 30; d += (d < 12 ? 3 : 9)) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)d * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ FZInstallPairingHooks(); });
     }
-    FZDumpClassesMatching(@[@"DeviceProps", @"HistorySyncConfig", @"CompanionProps", @"PairDevice", @"DevicePairing"],
+    FZDumpClassesMatching(@[@"DeviceProps", @"HistorySyncConfig", @"CompanionProps", @"PairDevice", @"DevicePairing", @"Pairing", @"RefCert", @"QRCode", @"WebClient", @"LinkedDevice"],
                           @"fckzck-pairing-classes.txt");
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
@@ -1253,6 +1257,10 @@ static void FZLoadHistoryConfig(void) {
                 FZ(@"FckZck: skipped empty ref-cert");
                 return;
             }
+            if (gSkipClientProps && [name isEqualToString:@"client-props"]) {
+                FZ(@"FckZck 1.29: skipped client-props");
+                return;
+            }
         }
     } @catch (NSException *e) {}
     %orig;
@@ -1269,6 +1277,10 @@ static void FZLoadHistoryConfig(void) {
                 FZ(@"FckZck: addChild %@ dataValue=%lu bytes children=%lu%@", n, (unsigned long)d.length, (unsigned long)kids, hex);
                 if (gSkipEmptyRefCert && [n isEqualToString:@"ref-cert"] && d.length == 0 && kids == 0) {
                     FZ(@"FckZck: skipped empty ref-cert");
+                    return;
+                }
+                if (gSkipClientProps && [n isEqualToString:@"client-props"]) {
+                    FZ(@"FckZck 1.29: skipped client-props");
                     return;
                 }
             }
