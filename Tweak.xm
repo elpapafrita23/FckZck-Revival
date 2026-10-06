@@ -400,9 +400,10 @@ static BOOL FZInstallUserAgentHooks(void) {
 //   "stock"              - original behaviour (logout)
 static void (*orig_hsInitial)(id, SEL);
 static void new_hsInitial(id self, SEL _cmd) {
-    FZ(@"FckZck: CompanionBootstrapLoading.handleInitialHistorySync called");
+    FZ(@"FckZck: CompanionBootstrapLoading.handleInitialHistorySync ENTER");
     gInitialCalled = YES;
     orig_hsInitial(self, _cmd);
+    FZ(@"FckZck: CompanionBootstrapLoading.handleInitialHistorySync EXIT");
 }
 
 static void (*orig_hsFailure)(id, SEL, id);
@@ -421,7 +422,9 @@ static void (*orig_hsHandle)(id, SEL, id, id);
 static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
     gHistSvc = self;
     @try {
-        NSMutableString *line = [NSMutableString stringWithFormat:@"FckZck: HistorySyncService.handleMessage class=%@", NSStringFromClass([msg class])];
+        static NSUInteger hsMessageCount = 0;
+        hsMessageCount++;
+        NSMutableString *line = [NSMutableString stringWithFormat:@"FckZck: HistorySyncService.handleMessage #%lu class=%@", (unsigned long)hsMessageCount, NSStringFromClass([msg class])];
         NSArray *paths = @[@"type",
                            @"historySyncNotification.syncType",
                            @"historySyncNotification.chunkOrder",
@@ -429,15 +432,21 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
                            @"historySyncNotification.fileLength",
                            @"historySyncNotification.hasDirectPath",
                            @"historySyncNotification.hasInitialHistBootstrapInlinePayload",
+                           @"historySyncNotification.mediaSize",
+                           @"historySyncNotification.initialHistBootstrapInlinePayload.length",
                            @"appStateSyncKeyShare.keys.@count"];
         for (NSString *kp in paths) {
             id v = nil;
             @try { v = [msg valueForKeyPath:kp]; } @catch (NSException *e) { v = nil; }
-            if ([v isKindOfClass:[NSNumber class]]) [line appendFormat:@" %@=%@", kp, v];
+            if (v) [line appendFormat:@" %@=%@", kp, v];
         }
         FZ(@"%@", line);
+        @try { FZ(@"FckZck: HistorySyncService.handleMessage msg=%@", FZDesc(msg)); } @catch (NSException *e) {}
     } @catch (NSException *e) {}
     orig_hsHandle(self, _cmd, msg, stanza);
+    @try {
+        FZ(@"FckZck: HistorySyncService.handleMessage #%lu AFTER isInitialSyncFinished=%d", (unsigned long)hsMessageCount, (int)[self isInitialSyncFinished]);
+    } @catch (NSException *e) {}
 }
 
 static void (*orig_preKeyFail)(id, SEL, id);
@@ -462,11 +471,12 @@ static long long new_syncState(id self, SEL _cmd) {
 
 static BOOL FZHookIfPresent(Class c, const char *selName, const char *wantEnc, IMP repl, IMP *orig);
 
-// 1.20 diagnostic hooks discovered from the class dump.
-// These deliberately OBSERVE the real History Sync state; they do not force completion.
+// 1.22 diagnostic hooks: observe the complete History Sync state transition.
+// These hooks deliberately do NOT force completion or alter authentication.
 static BOOL (*orig_deviceInitial)(id, SEL);
 static BOOL new_deviceInitial(id self, SEL _cmd) {
     BOOL v = orig_deviceInitial(self, _cmd);
+    FZ(@"FckZck: HistorySyncDevice.isInitialSyncFinished queried -> %d", v);
     static int last = -1;
     if (last != (int)v) { last = (int)v; FZ(@"FckZck: HistorySyncDevice.isInitialSyncFinished=%d", v); }
     return v;
@@ -475,6 +485,7 @@ static BOOL new_deviceInitial(id self, SEL _cmd) {
 static BOOL (*orig_deviceSyncing)(id, SEL);
 static BOOL new_deviceSyncing(id self, SEL _cmd) {
     BOOL v = orig_deviceSyncing(self, _cmd);
+    FZ(@"FckZck: HistorySyncDevice.isSyncing queried -> %d", v);
     static int last = -1;
     if (last != (int)v) { last = (int)v; FZ(@"FckZck: HistorySyncDevice.isSyncing=%d", v); }
     return v;
@@ -483,6 +494,7 @@ static BOOL new_deviceSyncing(id self, SEL _cmd) {
 static BOOL (*orig_deviceCompleted)(id, SEL);
 static BOOL new_deviceCompleted(id self, SEL _cmd) {
     BOOL v = orig_deviceCompleted(self, _cmd);
+    FZ(@"FckZck: HistorySyncDevice.isCompleted queried -> %d", v);
     static int last = -1;
     if (last != (int)v) { last = (int)v; FZ(@"FckZck: HistorySyncDevice.isCompleted=%d", v); }
     return v;
@@ -491,6 +503,7 @@ static BOOL new_deviceCompleted(id self, SEL _cmd) {
 static unsigned int (*orig_initialState)(id, SEL);
 static unsigned int new_initialState(id self, SEL _cmd) {
     unsigned int v = orig_initialState(self, _cmd);
+    FZ(@"FckZck: PBBProtoInitialSyncStateUpdate.state queried -> %u", v);
     static unsigned int last = UINT_MAX;
     if (last != v) { last = v; FZ(@"FckZck: PBBProtoInitialSyncStateUpdate.state=%u", v); }
     return v;
@@ -499,6 +512,7 @@ static unsigned int new_initialState(id self, SEL _cmd) {
 static double (*orig_initialProgress)(id, SEL);
 static double new_initialProgress(id self, SEL _cmd) {
     double v = orig_initialProgress(self, _cmd);
+    FZ(@"FckZck: PBBProtoInitialSyncStateUpdate.progress queried -> %.4f", v);
     static double last = -1.0;
     if (last < 0.0 || fabs(last - v) >= 0.01) { last = v; FZ(@"FckZck: PBBProtoInitialSyncStateUpdate.progress=%.4f", v); }
     return v;
@@ -574,8 +588,10 @@ static BOOL new_isInit(id self, SEL _cmd) {
 }
 static void (*orig_runWhen)(id, SEL, id);
 static void new_runWhen(id self, SEL _cmd, id blk) {
-    FZ(@"FckZck: HistorySyncCompanionService.runWhenInitialSyncFinished: called (block=%@)", blk ? @"yes" : @"nil");
+    FZ(@"FckZck: HistorySyncCompanionService.runWhenInitialSyncFinished ENTER (block=%@)", blk ? @"yes" : @"nil");
+    @try { FZ(@"FckZck: runWhenInitialSyncFinished current=%d", (int)[self isInitialSyncFinished]); } @catch (NSException *e) {}
     orig_runWhen(self, _cmd, blk);
+    @try { FZ(@"FckZck: runWhenInitialSyncFinished EXIT current=%d", (int)[self isInitialSyncFinished]); } @catch (NSException *e) {}
 }
 static void (*orig_didUpdAB)(id, SEL);
 static void new_didUpdAB(id self, SEL _cmd) {
