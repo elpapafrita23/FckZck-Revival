@@ -37,7 +37,6 @@ static BOOL gLidFallback = YES;
 static int gForceFinishSeconds = 0;  // 1.20 diagnostic: do not synthesize bootstrap completion.
 // 1.19 test: make the companion service report initial history sync as finished.
 static BOOL gForceInitialSyncFinished = NO;  // 1.27: only enabled after real HistorySyncDevice completion.
-static BOOL gAutoFinishInitialBootstrap = NO; // 1.27: never mark bootstrap complete merely on receipt.
 static BOOL gInitialCalled = NO;
 static BOOL gSecCalled = NO;
 static __weak id gHistSvc = nil;
