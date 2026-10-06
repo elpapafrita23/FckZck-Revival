@@ -15,6 +15,7 @@ static int gNum[4] = {2, 26, 38, 74};
 // Experiment: drop an EMPTY <ref-cert> node from the pair-device request.
 // Config key: <key>skipEmptyRefCert</key><true/> to turn it on.
 static NSString *gHistoryMode = @"continue";
+static NSNumber *gForceSyncState = nil;
 static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping did not fix the 400)
 // Experiment: OS version declared to the server in ClientPayload.UserAgent.
 // Config keys (strings): osVersion, osBuildNumber. An EMPTY osVersion disables
@@ -70,6 +71,8 @@ static void FZLoadConfig(void) {
     id hm = cfg[@"historySyncFailureMode"];
     if ([hm isKindOfClass:[NSString class]] && [(NSString *)hm length]) gHistoryMode = hm;
     FZ(@"FckZck: historySyncFailureMode=%@", gHistoryMode);
+    id fs = cfg[@"forceSyncState"];
+    if ([fs isKindOfClass:[NSNumber class]]) { gForceSyncState = fs; FZ(@"FckZck: forceSyncState=%@", fs); }
     id ov = cfg[@"osVersion"];
     if ([ov isKindOfClass:[NSString class]]) gOsVersion = [(NSString *)ov length] ? ov : nil;
     id ob = cfg[@"osBuildNumber"];
@@ -216,14 +219,11 @@ static void FZDumpElem(id<FZElem> e, int depth, NSMutableString *out) {
 // 20 s after launch, writes the names + method selectors + type encodings of
 // every class related to pairing / companion / ADV / stanzas to
 // <app Documents>/fckzck-classes.txt. Only in the main WhatsApp apps.
-__attribute__((unused)) static void FZDumpClasses(void) {
+static void FZDumpClassesMatching(NSArray *pats, NSString *fname) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     if (![bid isEqualToString:@"net.whatsapp.WhatsApp"] && ![bid isEqualToString:@"net.whatsapp.WhatsAppSMB"]) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSArray *pats = @[@"Pair", @"Companion", @"ADV", @"DeviceProps", @"DeviceIdentity",
-                          @"WAWebClient", @"LinkedDevice", @"LinkCode", @"Stanza",
-                          @"PreKey", @"SignedPreKey", @"SignalStore", @"SignalSession", @"IdentityStore"];
         NSMutableString *out = [NSMutableString string];
         unsigned int n = 0;
         Class *classes = objc_copyClassList(&n);
@@ -250,9 +250,9 @@ __attribute__((unused)) static void FZDumpClasses(void) {
         }
         free(classes);
         NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *path = [[dirs firstObject] stringByAppendingPathComponent:@"fckzck-classes.txt"];
+        NSString *path = [[dirs firstObject] stringByAppendingPathComponent:fname];
         [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        FZ(@"FckZck: class dump written (%lu bytes)", (unsigned long)out.length);
+        FZ(@"FckZck: class dump %@ written (%lu bytes)", fname, (unsigned long)out.length);
     });
 }
 // -------------------------------------------------------------------------
@@ -348,11 +348,14 @@ static void (*orig_hsHandle)(id, SEL, id, id);
 static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
     @try {
         NSMutableString *line = [NSMutableString stringWithFormat:@"FckZck: HistorySyncService.handleMessage class=%@", NSStringFromClass([msg class])];
-        NSArray *paths = @[@"protocolMessage.type",
-                           @"protocolMessage.historySyncNotification.syncType",
-                           @"protocolMessage.historySyncNotification.chunkOrder",
-                           @"protocolMessage.historySyncNotification.progress",
-                           @"protocolMessage.historySyncNotification.fileLength"];
+        NSArray *paths = @[@"type",
+                           @"historySyncNotification.syncType",
+                           @"historySyncNotification.chunkOrder",
+                           @"historySyncNotification.progress",
+                           @"historySyncNotification.fileLength",
+                           @"historySyncNotification.hasDirectPath",
+                           @"historySyncNotification.hasInitialHistBootstrapInlinePayload",
+                           @"appStateSyncKeyShare.keys.@count"];
         for (NSString *kp in paths) {
             id v = nil;
             @try { v = [msg valueForKeyPath:kp]; } @catch (NSException *e) { v = nil; }
@@ -367,6 +370,19 @@ static void (*orig_preKeyFail)(id, SEL, id);
 static void new_preKeyFail(id self, SEL _cmd, id err) {
     FZ(@"FckZck: CompanionRegistrationLogger.handlePreKeysUploadFail(%@)", FZDesc(err));
     orig_preKeyFail(self, _cmd, err);
+}
+
+
+// UI controller state (the 120 s history-sync timeout decides based on this).
+// Logs every change of the value. Optional override via plist key
+// forceSyncState (integer) to experiment with the "finished" value.
+static long long (*orig_syncState)(id, SEL);
+static long long new_syncState(id self, SEL _cmd) {
+    long long v = orig_syncState(self, _cmd);
+    static long long last = -9999;
+    if (v != last) { FZ(@"FckZck: HistorySync UI currentSyncState=%lld", v); last = v; }
+    if (gForceSyncState) return [gForceSyncState longLongValue];
+    return v;
 }
 
 static BOOL FZHookIfPresent(Class c, const char *selName, const char *wantEnc, IMP repl, IMP *orig) {
@@ -388,6 +404,10 @@ static BOOL FZInstallHistoryHooks(void) {
     if (gHistoryHooksDone) return YES;
     Class boot = objc_getClass("WACompanionRegistration.CompanionBootstrapLoading");
     if (!boot) boot = objc_getClass("_TtC23WACompanionRegistration25CompanionBootstrapLoading");
+    Class ui = objc_getClass("WAHistorySync.HistorySyncCompanionUserInterfaceController");
+    if (!ui) ui = objc_getClass("_TtC13WAHistorySync43HistorySyncCompanionUserInterfaceController");
+    if (ui) FZHookIfPresent(ui, "currentSyncState", "q16@0:8", (IMP)new_syncState, (IMP *)&orig_syncState);
+    else FZ(@"FckZck: HistorySyncCompanionUserInterfaceController not found");
     Class svc = objc_getClass("WAHistorySyncCompanionService");
     Class lgr = objc_getClass("WACompanionRegistrationLogger");
     if (!boot && !svc && !lgr) return NO;
@@ -405,13 +425,14 @@ static BOOL FZInstallHistoryHooks(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.9.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.10.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!FZInstallUserAgentHooks()) FZ(@"FckZck: WAPBClientPayload_UserAgent still not found");
         });
     }
+    FZDumpClassesMatching(@[@"Logout", @"AccountCleaner", @"RemovalReason", @"OwnDevice", @"Bootstrap", @"HistorySync", @"SyncState"], @"fckzck-classes2.txt");
     if (!FZInstallHistoryHooks()) {
         FZ(@"FckZck: history-sync classes not found yet, retrying in 3s and 10s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
