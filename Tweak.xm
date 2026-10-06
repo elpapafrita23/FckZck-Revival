@@ -25,6 +25,12 @@ static BOOL gBlockHistoryTimeoutLogout = NO;  // 1.12: OFF. Log 3 showed it only
 // Experiment (1.12): force WASignalAddress "deprecated" for individual (non-group) sessions.
 // -1 = leave as is, 0 = force NO (default), 1 = force YES. Config key: signalDeprecatedOverride (integer).
 static int gDeprecatedOverride = 0;
+// Experiment (1.17): the app keeps the primary\'s Signal session under its LID address, but some
+// messages from the same sender arrive addressed by phone number (PN) and look for a session
+// that does not exist (-> missing one-time prekey, -1003). When a PN decrypt fails, retry it with
+// the LID addresses that already decrypted something. A successful decrypt proves the identity, so
+// the PN->LID pair is then remembered. Config key: lidFallback (bool, default ON).
+static BOOL gLidFallback = YES;
 // Experiment (1.13): if the bootstrap ("loading your chats") has not been told that the initial
 // history sync finished N seconds after pairing, tell it ourselves. 0 = off.
 // Config key: forceFinishBootstrapSeconds (integer).
@@ -120,6 +126,9 @@ static void FZLoadConfig(void) {
     id so = cfg[@"signalDeprecatedOverride"];
     if ([so isKindOfClass:[NSNumber class]]) gDeprecatedOverride = [so intValue];
     FZ(@"FckZck: signalDeprecatedOverride=%d", gDeprecatedOverride);
+    id lf = cfg[@"lidFallback"];
+    if ([lf respondsToSelector:@selector(boolValue)]) gLidFallback = [lf boolValue];
+    FZ(@"FckZck: lidFallback=%d", gLidFallback);
     id hm = cfg[@"historySyncFailureMode"];
     if ([hm isKindOfClass:[NSString class]] && [(NSString *)hm length]) gHistoryMode = hm;
     FZ(@"FckZck: historySyncFailureMode=%@", gHistoryMode);
@@ -675,11 +684,52 @@ static BOOL new_storePre(id self, SEL _cmd, id rec, int pid) {
     return r;
 }
 
+static NSMutableArray *gLidAddrs;       // @lid addresses that decrypted something OK
+static NSMutableDictionary *gPnToLid;   // PN address description -> LID address (proven by a decrypt)
+
+static NSString *FZAddrKey(id a) { return [NSString stringWithFormat:@"%@", a]; }
+static BOOL FZIsLid(id a) { return a && [FZAddrKey(a) rangeOfString:@"@lid"].location != NSNotFound; }
+static BOOL FZIsPn(id a)  { return a && [FZAddrKey(a) rangeOfString:@"@s.whatsapp.net"].location != NSNotFound; }
+
+static void FZRememberLid(id addr) {
+    if (!FZIsLid(addr) || !gLidAddrs) return;
+    NSString *k = FZAddrKey(addr);
+    @synchronized (gLidAddrs) {
+        for (id a in gLidAddrs) { if ([FZAddrKey(a) isEqualToString:k]) return; }
+        if (gLidAddrs.count < 8) {
+            [gLidAddrs addObject:addr];
+            FZ(@"FckZck: remembered LID address %@", FZMask(k));
+        }
+    }
+}
+
+// Candidates to retry a failed PN decrypt with: the proven mapping first, then every known LID.
+static NSArray *FZLidCandidates(id pnAddr) {
+    if (!gLidFallback || !gLidAddrs || !FZIsPn(pnAddr)) return nil;
+    NSMutableArray *order = [NSMutableArray array];
+    @synchronized (gLidAddrs) {
+        id mapped = gPnToLid[FZAddrKey(pnAddr)];
+        if (mapped) [order addObject:mapped];
+        for (id c in gLidAddrs) { if (c != mapped) [order addObject:c]; }
+    }
+    return order;
+}
+
+static void FZRememberPair(id pnAddr, id lidAddr) {
+    @synchronized (gLidAddrs) { gPnToLid[FZAddrKey(pnAddr)] = lidAddr; }
+}
+
 static int (*orig_decPre)(id, SEL, id, id, void *, BOOL);
 static int new_decPre(id self, SEL _cmd, id data, id addr, void *out, BOOL stateless) {
     int r = orig_decPre(self, _cmd, data, addr, out, stateless);
     FZ(@"FckZck: Coordinator.decryptPreKeyCiphertext len=%lu addr=%@ stateless=%d -> %d",
        (unsigned long)[(NSData *)data length], FZAddr(addr), stateless, r);
+    if (r == 0) { FZRememberLid(addr); return r; }
+    for (id c in FZLidCandidates(addr)) {
+        int r2 = orig_decPre(self, _cmd, data, c, out, stateless);
+        FZ(@"FckZck: LID fallback (pkmsg) %@ via %@ -> %d", FZMask(FZAddrKey(addr)), FZMask(FZAddrKey(c)), r2);
+        if (r2 == 0) { FZRememberPair(addr, c); return 0; }
+    }
     return r;
 }
 
@@ -688,12 +738,19 @@ static int new_decReg(id self, SEL _cmd, id data, id addr, void *out) {
     int r = orig_decReg(self, _cmd, data, addr, out);
     FZ(@"FckZck: Coordinator.decryptRegularCiphertext len=%lu addr=%@ -> %d",
        (unsigned long)[(NSData *)data length], FZAddr(addr), r);
+    if (r == 0) { FZRememberLid(addr); return r; }
+    for (id c in FZLidCandidates(addr)) {
+        int r2 = orig_decReg(self, _cmd, data, c, out);
+        FZ(@"FckZck: LID fallback (msg) %@ via %@ -> %d", FZMask(FZAddrKey(addr)), FZMask(FZAddrKey(c)), r2);
+        if (r2 == 0) { FZRememberPair(addr, c); return 0; }
+    }
     return r;
 }
 
 static BOOL gSignalHooked = NO;
 static BOOL FZInstallSignalHooks(void) {
     if (gSignalHooked) return YES;
+    if (!gLidAddrs) { gLidAddrs = [NSMutableArray array]; gPnToLid = [NSMutableDictionary dictionary]; }
     Class ad = objc_getClass("WASignalAddress");
     Class ks = objc_getClass("WASignalKeyStore");
     Class co = objc_getClass("WASignalCoordinator");
@@ -721,7 +778,7 @@ static BOOL FZInstallSignalHooks(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.16.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.17.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
