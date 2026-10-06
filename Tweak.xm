@@ -39,19 +39,12 @@ static BOOL gLidFallback = YES;
 // Experiment (1.13): if the bootstrap ("loading your chats") has not been told that the initial
 // history sync finished N seconds after pairing, tell it ourselves. 0 = off.
 // Config key: forceFinishBootstrapSeconds (integer).
-static int gForceFinishSeconds = 25; // 1.26: fallback, finish the bootstrap this many s after it starts (0 = off).
+static int gForceFinishSeconds = 0; // 1.28.1: disabled; never force bootstrap completion.
 // 1.19 test: make the companion service report initial history sync as finished.
-static BOOL gForceInitialSyncFinished = NO;  // 1.20 diagnostic / compatibility override.
-static BOOL gAutoFinishInitialBootstrap = YES; // 1.25: iOS 12 compatibility once INITIAL_BOOTSTRAP is actually received.
 static BOOL gInitialCalled = NO;
 static BOOL gSecCalled = NO;
 static __weak id gHistSvc = nil;
-static BOOL gForceScheduled = NO;
 static long long gBlockLogoutReason = 11;
-static id gBootObj = nil;               // 1.26: strong ref so it cannot vanish before we use it
-static BOOL gBootstrapSeen = NO;
-static BOOL gFinishRunning = NO;
-static int gFinishTries = 0;
 static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping did not fix the 400)
 // Experiment: OS version declared to the server in ClientPayload.UserAgent.
 // Config keys (strings): osVersion, osBuildNumber. An EMPTY osVersion disables
@@ -134,10 +127,9 @@ static void FZLoadConfig(void) {
     id bl = cfg[@"blockHistoryTimeoutLogout"];
     if ([bl respondsToSelector:@selector(boolValue)]) gBlockHistoryTimeoutLogout = [bl boolValue];
     gBlockLogoutReason = 11;
-    FZ(@"FckZck 1.26: blockHistoryTimeoutLogout=%d reason=%lld", gBlockHistoryTimeoutLogout, gBlockLogoutReason);
-    id ff = cfg[@"forceFinishBootstrapSeconds"];
-    if ([ff isKindOfClass:[NSNumber class]]) gForceFinishSeconds = [ff intValue];
-    FZ(@"FckZck: forceFinishBootstrapSeconds=%d", gForceFinishSeconds);
+    FZ(@"FckZck 1.28.1: blockHistoryTimeoutLogout=%d reason=%lld", gBlockHistoryTimeoutLogout, gBlockLogoutReason);
+    gForceFinishSeconds = 0;
+    FZ(@"FckZck 1.28.1: forceFinishBootstrapSeconds=0 (fixed off)");
     id rf = cfg[@"requireFullSync"];
     if ([rf respondsToSelector:@selector(boolValue)]) gReqFullSync = [rf boolValue];
     id hd = cfg[@"historyDays"];
@@ -152,16 +144,13 @@ static void FZLoadConfig(void) {
     // Keep stock failure handling; the compatibility path is only activated
     // when runWhenInitialSyncFinished is actually reached.
     gHistoryMode = @"stock";
-    FZ(@"FckZck 1.25: historySyncFailureMode=%@ (fixed)", gHistoryMode);
-    id fis = cfg[@"forceInitialSyncFinished"];
-    if ([fis respondsToSelector:@selector(boolValue)]) gForceInitialSyncFinished = [fis boolValue];
-    FZ(@"FckZck: forceInitialSyncFinished=%d", gForceInitialSyncFinished);
+    FZ(@"FckZck 1.28.1: historySyncFailureMode=%@ (fixed)", gHistoryMode);
     id fs = cfg[@"forceSyncState"];
     if ([fs isKindOfClass:[NSNumber class]]) { gForceSyncState = fs; FZ(@"FckZck: forceSyncState=%@", fs); } else { FZ(@"FckZck: forceSyncState default=%@", gForceSyncState); }
     // Never consume legacy osVersion/osBuildNumber plist overrides.
     gOsVersion = nil;
     gOsBuild = nil;
-    FZ(@"FckZck 1.25: osVersion override=(off) osBuildNumber override=(off) (fixed)");
+    FZ(@"FckZck 1.28.1: osVersion override=(off) osBuildNumber override=(off) (fixed)");
     if ([v isKindOfClass:[NSString class]] && v.length) wanted = v;
     else FZ(@"FckZck: no config found, using default version");
 
@@ -414,7 +403,6 @@ static BOOL FZInstallUserAgentHooks(void) {
 //   "continue" (default) - on failure behave as if the initial sync finished
 //   "ignore"             - on failure do nothing (loading screen may stay)
 //   "stock"              - original behaviour (logout)
-static void FZFinishBootstrap(const char *why);
 static void (*orig_hsInitial)(id, SEL);
 static void new_hsInitial(id self, SEL _cmd) {
     FZ(@"FckZck: CompanionBootstrapLoading.handleInitialHistorySync called");
@@ -454,26 +442,9 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
         }
         FZ(@"%@", line);
     } @catch (NSException *e) {}
-    // 1.26: decide BEFORE the original runs (it consumes the notification, which is why the
-    // 1.25 check after the call never matched). hasInitialHistBootstrapInlinePayload is a
-    // plain NSNumber, the same key the log line above already prints successfully.
-    BOOL isBootstrapInline = NO;
-    @try {
-        id st  = [msg valueForKeyPath:@"historySyncNotification.syncType"];
-        id has = [msg valueForKeyPath:@"historySyncNotification.hasInitialHistBootstrapInlinePayload"];
-        isBootstrapInline = [st respondsToSelector:@selector(integerValue)] && [st integerValue] == 0 &&
-                            [has respondsToSelector:@selector(boolValue)] && [has boolValue];
-    } @catch (NSException *e) { isBootstrapInline = NO; }
+    // 1.28.1: observe the notification only; never force bootstrap completion here.
     orig_hsHandle(self, _cmd, msg, stanza);
 
-    if (gAutoFinishInitialBootstrap && isBootstrapInline && !gBootstrapSeen) {
-        gBootstrapSeen = YES;
-        gForceInitialSyncFinished = YES;
-        FZ(@"FckZck 1.26: INITIAL_BOOTSTRAP received; completing the bootstrap in 6 s");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            FZFinishBootstrap("INITIAL_BOOTSTRAP received");
-        });
-    }
 }
 
 static void (*orig_preKeyFail)(id, SEL, id);
@@ -602,34 +573,14 @@ static BOOL new_isInit(id self, SEL _cmd) {
     BOOL r = orig_isInit(self, _cmd);
     static int last = -1;
     if (last != (int)r) { last = (int)r; FZ(@"FckZck: HistorySyncCompanionService.isInitialSyncFinished -> %d", r); }
-    if (gForceInitialSyncFinished) {
-        FZ(@"FckZck: forcing isInitialSyncFinished -> YES");
-        return YES;
-    }
     return r;
 }
 static void (*orig_runWhen)(id, SEL, id);
 static void new_runWhen(id self, SEL _cmd, id blk) {
-    FZ(@"FckZck: HistorySyncCompanionService.runWhenInitialSyncFinished: called (block=%@)", blk ? @"yes" : @"nil");
-    if (blk) {
-        BOOL realFinished = NO;
-        @try { realFinished = orig_isInit ? orig_isInit(self, sel_registerName("isInitialSyncFinished")) : NO; } @catch (NSException *e) {}
-        if (!realFinished) {
-            // This is the exact deadlock observed on iOS 12: the continuation is
-            // registered, but the Swift HistorySyncDevice never flips the state.
-            gForceInitialSyncFinished = YES;
-            FZ(@"FckZck 1.25: runWhenInitialSyncFinished while state=0; executing continuation directly");
-            @try {
-                void (^continuation)(void) = (void (^)(void))blk;
-                continuation();
-                FZ(@"FckZck 1.25: initial-sync continuation executed");
-            } @catch (NSException *e) {
-                FZ(@"FckZck 1.25: continuation exception=%@; falling back to original", e);
-                orig_runWhen(self, _cmd, blk);
-            }
-            return;
-        }
-    }
+    BOOL realFinished = NO;
+    @try { realFinished = orig_isInit ? orig_isInit(self, sel_registerName("isInitialSyncFinished")) : NO; } @catch (NSException *e) {}
+    FZ(@"FckZck 1.28.1: runWhenInitialSyncFinished called block=%@ realState=%d", blk ? @"yes" : @"nil", realFinished);
+    // Preserve WhatsApp's original continuation semantics. Never execute it early.
     orig_runWhen(self, _cmd, blk);
 }
 static void (*orig_didUpdAB)(id, SEL);
@@ -643,9 +594,7 @@ static void new_resumeBg(id self, SEL _cmd) {
     orig_resumeBg(self, _cmd);
 }
 
-// CompanionBootstrapLoading waits for several steps. Log 6 showed criticalBlock, criticalUnblockLow
-// and (forced) initialSync, but never handleSecurityNotificationSetting -- the primary normally
-// delivers that through history sync, which never gets processed here.
+// Observe the bootstrap critical block without changing WhatsApp state.
 static void (*orig_hsSec)(id, SEL);
 static void new_hsSec(id self, SEL _cmd) {
     FZ(@"FckZck: CompanionBootstrapLoading.handleSecurityNotificationSetting called");
@@ -653,58 +602,12 @@ static void new_hsSec(id self, SEL _cmd) {
     orig_hsSec(self, _cmd);
 }
 
-// 1.26: complete the companion bootstrap by hand. The log shows that on iOS 12 the Swift
-// history-sync code receives INITIAL_BOOTSTRAP but never calls handleInitialHistorySync or
-// handleSecurityNotificationSetting on the bootstrap object, so after 120 s the app removes its
-// own companion device (history_sync_timeout). We call those two steps ourselves.
-static void FZFinishBootstrap(const char *why) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (gInitialCalled && gSecCalled) { FZ(@"FckZck 1.26: finish(%s): nothing to do, steps already reported", why); return; }
-        id boot = gBootObj;
-        if (!boot || !orig_hsInitial) {
-            if (gFinishTries++ < 30) {
-                FZ(@"FckZck 1.26: finish(%s): no bootstrap object yet, retry in 2 s (%d)", why, gFinishTries);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    FZFinishBootstrap(why);
-                });
-            } else FZ(@"FckZck 1.26: finish(%s): gave up, no bootstrap object", why);
-            return;
-        }
-        if (gFinishRunning) return;
-        gFinishRunning = YES;
-        FZ(@"FckZck 1.26: finish(%s): initialCalled=%d secCalled=%d", why, gInitialCalled, gSecCalled);
-        @try {
-            if (!gInitialCalled) {
-                gInitialCalled = YES;
-                FZ(@"FckZck 1.26: calling handleInitialHistorySync");
-                orig_hsInitial(boot, sel_registerName("handleInitialHistorySync"));
-            }
-        } @catch (NSException *e) { FZ(@"FckZck 1.26: handleInitialHistorySync exception=%@", e); }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            @try {
-                if (!gSecCalled && orig_hsSec) {
-                    gSecCalled = YES;
-                    FZ(@"FckZck 1.26: calling handleSecurityNotificationSetting");
-                    orig_hsSec(boot, sel_registerName("handleSecurityNotificationSetting"));
-                }
-            } @catch (NSException *e) { FZ(@"FckZck 1.26: handleSecurityNotificationSetting exception=%@", e); }
-            gFinishRunning = NO;
-        });
-    });
-}
-
 static void (*orig_critBlock)(id, SEL, id);
 static void new_critBlock(id self, SEL _cmd, id arg) {
-    gBootObj = self;
-    if (gForceFinishSeconds > 0 && !gForceScheduled) {
-        gForceScheduled = YES;
-        FZ(@"FckZck: bootstrap object captured, will finish it in %d s if still loading", gForceFinishSeconds);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)gForceFinishSeconds * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            FZFinishBootstrap("fallback timer");
-        });
-    }
+    FZ(@"FckZck 1.28.1: bootstrap critical block entered");
     orig_critBlock(self, _cmd, arg);
 }
+
 
 // WAAccountCleaner logout entry points. The timeout path in log 2 went through
 // logoutAuthenticatedCompanionWithReason (".../normal/11").
@@ -712,8 +615,7 @@ static void (*orig_logoutAuth)(id, SEL, long long, BOOL, id);
 static void new_logoutAuth(id self, SEL _cmd, long long reason, BOOL restart, id ctx) {
     FZ(@"FckZck: WAAccountCleaner.logoutAuthenticatedCompanion reason=%lld restart=%d", reason, restart);
     if (gBlockHistoryTimeoutLogout && reason == gBlockLogoutReason) {
-        FZ(@"FckZck 1.26: -> history_sync_timeout logout blocked, finishing the bootstrap instead");
-        FZFinishBootstrap("timeout logout blocked");
+        FZ(@"FckZck 1.28.1: -> history_sync_timeout logout blocked (no forced completion)");
         return;
     }
     orig_logoutAuth(self, _cmd, reason, restart, ctx);
@@ -947,7 +849,7 @@ static BOOL FZInstallSignalHooks(void) {
 }
 // -------------------------------------------------------------------------
 
-// ---- 1.27.1: DeviceProps (what the companion tells the PRIMARY PHONE) -------
+// ---- 1.28.1: DeviceProps (what the companion tells the PRIMARY PHONE) -------
 // Log 2: classes WAPBDeviceProps* do not exist, and no pair-device stanza is used. So we find, at
 // runtime, every class with a setter taking the DeviceProps bytes (setDeviceProps: etc.), and
 // rewrite those bytes as raw protobuf: spoofed app version (field 2), requireFullSync (4) and a
