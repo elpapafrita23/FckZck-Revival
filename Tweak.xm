@@ -1003,6 +1003,13 @@ static NSData *FZTuneDevicePropsData(NSData *in) {
         FZPBSet(cfg, 5, 0, @(gHistDays));     // recentSyncDaysLimit
         FZPBSet(f, 5, 2, FZPBSerialize(cfg));
         NSData *out = FZPBSerialize(f);
+        static int hexN = 0;
+        if (hexN++ < 3) {
+            NSMutableString *h1 = [NSMutableString string], *h2 = [NSMutableString string];
+            for (NSUInteger i = 0; i < in.length && i < 96; i++) [h1 appendFormat:@"%02x", ((const uint8_t *)in.bytes)[i]];
+            for (NSUInteger i = 0; i < out.length && i < 96; i++) [h2 appendFormat:@"%02x", ((const uint8_t *)out.bytes)[i]];
+            FZ(@"FckZck 1.27: DeviceProps hex in=%@ out=%@", h1, h2);
+        }
         FZ(@"FckZck 1.27: DeviceProps rewritten %lu -> %lu bytes (version %@, fullSync=%d, days=%d)", (unsigned long)in.length, (unsigned long)out.length, gVersion, gReqFullSync, gHistDays);
         return out;
     } @catch (NSException *e) { FZ(@"FckZck 1.27: DeviceProps rewrite exception %@", e); return in; }
@@ -1167,6 +1174,67 @@ static void FZInstallPayloadHook(void) {
     });
 }
 
+// ---- 1.27.4: trace + early rewrite at the GPBMessage serialization entry points ------
+// Log 5: ClientPayload.data / companionProps setters/getters never fired while registering
+// ("register_as_companion_phone"), so the payload is serialized through another GPB path.
+// Hook the base GPBMessage methods; trace WAPBClientPayload*/WAPBCompanion* and rewrite the
+// props in serializedSize (the first call of every serialization path).
+static int gTraceN = 0;
+static BOOL FZTraced(id self, BOOL *isPayload) {
+    const char *cn = object_getClassName(self);
+    if (!cn) return NO;
+    *isPayload = (strcmp(cn, "WAPBClientPayload") == 0);
+    return *isPayload || strncmp(cn, "WAPBClientPayload_", 18) == 0 || strncmp(cn, "WAPBCompanion", 13) == 0;
+}
+static BOOL gTraceHooked = NO;
+static void FZInstallTraceHooks(void) {
+    if (gTraceHooked) return;
+    Class g = objc_getClass("GPBMessage");
+    if (!g) return;
+    gTraceHooked = YES;
+    FZHookB(g, "serializedSize", "", ^IMP(IMP *slot, SEL s) {
+        return imp_implementationWithBlock(^unsigned long(id self) {
+            BOOL pl = NO;
+            if (FZTraced(self, &pl)) {
+                if (gTraceN++ < 60) FZ(@"FckZck 1.27: trace serializedSize %s", object_getClassName(self));
+                if (pl) FZTunePayload(self);
+            }
+            return ((unsigned long (*)(id, SEL))*slot)(self, s);
+        });
+    });
+    FZHookB(g, "data", "", ^IMP(IMP *slot, SEL s) {
+        return imp_implementationWithBlock(^id(id self) {
+            BOOL pl = NO;
+            if (FZTraced(self, &pl) && gTraceN++ < 60) FZ(@"FckZck 1.27: trace data %s", object_getClassName(self));
+            return ((id (*)(id, SEL))*slot)(self, s);
+        });
+    });
+    FZHookB(g, "writeToCodedOutputStream:", "@", ^IMP(IMP *slot, SEL s) {
+        return imp_implementationWithBlock(^(id self, id st) {
+            BOOL pl = NO;
+            if (FZTraced(self, &pl) && gTraceN++ < 60) FZ(@"FckZck 1.27: trace writeToCodedOutputStream %s", object_getClassName(self));
+            ((void (*)(id, SEL, id))*slot)(self, s, st);
+        });
+    });
+    FZHookB(g, "writeToOutputStream:", "@", ^IMP(IMP *slot, SEL s) {
+        return imp_implementationWithBlock(^(id self, id st) {
+            BOOL pl = NO;
+            if (FZTraced(self, &pl)) {
+                if (gTraceN++ < 60) FZ(@"FckZck 1.27: trace writeToOutputStream %s", object_getClassName(self));
+                if (pl) FZTunePayload(self);
+            }
+            ((void (*)(id, SEL, id))*slot)(self, s, st);
+        });
+    });
+    FZHookB(g, "delimitedData", "", ^IMP(IMP *slot, SEL s) {
+        return imp_implementationWithBlock(^id(id self) {
+            BOOL pl = NO;
+            if (FZTraced(self, &pl) && gTraceN++ < 60) FZ(@"FckZck 1.27: trace delimitedData %s", object_getClassName(self));
+            return ((id (*)(id, SEL))*slot)(self, s);
+        });
+    });
+}
+
 static int gPropsHooks = 0;
 static NSMutableSet *gPropsSeen;
 static void FZScanDeviceProps(void) {
@@ -1200,6 +1268,7 @@ static void FZScanLoop(int left) {
     FZScanDeviceProps();
     FZInstallCompanionHooks();
     FZInstallPayloadHook();
+    FZInstallTraceHooks();
     if (left > 0) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ FZScanLoop(left - 1); });
     else FZ(@"FckZck 1.27: scan finished, hooks=%d", gPropsHooks);
 }
@@ -1207,7 +1276,7 @@ static void FZScanLoop(int left) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.27.3 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.27.4 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
