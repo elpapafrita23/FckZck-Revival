@@ -14,14 +14,14 @@ static NSString *gHash = nil;
 static int gNum[4] = {2, 26, 38, 74};
 // Experiment: drop an EMPTY <ref-cert> node from the pair-device request.
 // Config key: <key>skipEmptyRefCert</key><true/> to turn it on.
-static NSString *gHistoryMode = @"continue";
+static NSString *gHistoryMode = @"stock";
 static NSNumber *gForceSyncState = nil;  // 1.20 diagnostic: observe the real UI state; do not force it.
 // Experiment (1.11): the app logs itself out ~120 s after pairing because history sync never
 // completes (reason "history_sync_timeout"). When ON, that single logout is swallowed and the
 // bootstrap is told the initial history sync finished instead.
 // Config keys: blockHistoryTimeoutLogout (bool, default ON),
 //              historyTimeoutRemovalReason (integer, default 11 = value seen in log 2).
-static BOOL gBlockHistoryTimeoutLogout = YES;  // 1.20 diagnostic: keep the companion alive at timeout so we can inspect the real state.
+static BOOL gBlockHistoryTimeoutLogout = NO;  // 1.20 diagnostic: keep the companion alive at timeout so we can inspect the real state.
 // Experiment (1.12): force WASignalAddress "deprecated" for individual (non-group) sessions.
 // -1 = leave as is, 0 = force NO (default), 1 = force YES. Config key: signalDeprecatedOverride (integer).
 static int gDeprecatedOverride = 0;
@@ -37,7 +37,7 @@ static BOOL gLidFallback = YES;
 static int gForceFinishSeconds = 0;  // 1.20 diagnostic: do not synthesize bootstrap completion.
 // 1.19 test: make the companion service report initial history sync as finished.
 static BOOL gForceInitialSyncFinished = NO;  // 1.20 diagnostic / compatibility override.
-static BOOL gAutoFinishInitialBootstrap = YES; // 1.24: iOS 12 compatibility once INITIAL_BOOTSTRAP is actually received.
+static BOOL gAutoFinishInitialBootstrap = YES; // 1.25: iOS 12 compatibility once INITIAL_BOOTSTRAP is actually received.
 static BOOL gInitialCalled = NO;
 static BOOL gSecCalled = NO;
 static __weak id gHistSvc = nil;
@@ -48,8 +48,8 @@ static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping 
 // Experiment: OS version declared to the server in ClientPayload.UserAgent.
 // Config keys (strings): osVersion, osBuildNumber. An EMPTY osVersion disables
 // the override (the real iOS version is sent).
-static NSString *gOsVersion = @"15.8.3";
-static NSString *gOsBuild = @"19H386";
+static NSString *gOsVersion = nil;
+static NSString *gOsBuild = nil;
 
 // ---- File logging -------------------------------------------------------
 // Writes to <app Documents>/fckzck.log (and NSLog). Lets you read the log with
@@ -118,11 +118,12 @@ static void FZLoadConfig(void) {
     NSString *v = cfg[@"version"];
     id skip = cfg[@"skipEmptyRefCert"];
     if ([skip respondsToSelector:@selector(boolValue)]) gSkipEmptyRefCert = [skip boolValue];
-    id bl = cfg[@"blockHistoryTimeoutLogout"];
-    if ([bl respondsToSelector:@selector(boolValue)]) gBlockHistoryTimeoutLogout = [bl boolValue];
-    id br = cfg[@"historyTimeoutRemovalReason"];
-    if ([br isKindOfClass:[NSNumber class]]) gBlockLogoutReason = [br longLongValue];
-    FZ(@"FckZck: blockHistoryTimeoutLogout=%d reason=%lld", gBlockHistoryTimeoutLogout, gBlockLogoutReason);
+    // 1.25 compatibility profile: ignore stale plist values from older tests.
+    // In particular, never restore the old iOS-15 UserAgent override or the
+    // timeout-logout blocker that made later runs look like an auth failure.
+    gBlockHistoryTimeoutLogout = NO;
+    gBlockLogoutReason = 11;
+    FZ(@"FckZck 1.25: fixed profile blockHistoryTimeoutLogout=%d reason=%lld", gBlockHistoryTimeoutLogout, gBlockLogoutReason);
     id ff = cfg[@"forceFinishBootstrapSeconds"];
     if ([ff isKindOfClass:[NSNumber class]]) gForceFinishSeconds = [ff intValue];
     FZ(@"FckZck: forceFinishBootstrapSeconds=%d", gForceFinishSeconds);
@@ -132,20 +133,19 @@ static void FZLoadConfig(void) {
     id lf = cfg[@"lidFallback"];
     if ([lf respondsToSelector:@selector(boolValue)]) gLidFallback = [lf boolValue];
     FZ(@"FckZck: lidFallback=%d", gLidFallback);
-    id hm = cfg[@"historySyncFailureMode"];
-    if ([hm isKindOfClass:[NSString class]] && [(NSString *)hm length]) gHistoryMode = hm;
-    FZ(@"FckZck: historySyncFailureMode=%@", gHistoryMode);
+    // Keep stock failure handling; the compatibility path is only activated
+    // when runWhenInitialSyncFinished is actually reached.
+    gHistoryMode = @"stock";
+    FZ(@"FckZck 1.25: historySyncFailureMode=%@ (fixed)", gHistoryMode);
     id fis = cfg[@"forceInitialSyncFinished"];
     if ([fis respondsToSelector:@selector(boolValue)]) gForceInitialSyncFinished = [fis boolValue];
     FZ(@"FckZck: forceInitialSyncFinished=%d", gForceInitialSyncFinished);
     id fs = cfg[@"forceSyncState"];
     if ([fs isKindOfClass:[NSNumber class]]) { gForceSyncState = fs; FZ(@"FckZck: forceSyncState=%@", fs); } else { FZ(@"FckZck: forceSyncState default=%@", gForceSyncState); }
-    id ov = cfg[@"osVersion"];
-    if ([ov isKindOfClass:[NSString class]]) gOsVersion = [(NSString *)ov length] ? ov : nil;
-    id ob = cfg[@"osBuildNumber"];
-    if ([ob isKindOfClass:[NSString class]]) gOsBuild = [(NSString *)ob length] ? ob : nil;
-    if (!gOsVersion) gOsBuild = nil;
-    FZ(@"FckZck: osVersion override=%@ osBuildNumber override=%@", gOsVersion ? gOsVersion : @"(off)", gOsBuild ? gOsBuild : @"(off)");
+    // Never consume legacy osVersion/osBuildNumber plist overrides.
+    gOsVersion = nil;
+    gOsBuild = nil;
+    FZ(@"FckZck 1.25: osVersion override=(off) osBuildNumber override=(off) (fixed)");
     if ([v isKindOfClass:[NSString class]] && v.length) wanted = v;
     else FZ(@"FckZck: no config found, using default version");
 
@@ -450,11 +450,11 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
                 [inlinePayload length] > 0) {
                 if (!gForceInitialSyncFinished) {
                     gForceInitialSyncFinished = YES;
-                    FZ(@"FckZck 1.24: INITIAL_BOOTSTRAP received (%lu bytes); enabling compatibility completion", (unsigned long)[inlinePayload length]);
+                    FZ(@"FckZck 1.25: INITIAL_BOOTSTRAP received (%lu bytes); enabling compatibility completion", (unsigned long)[inlinePayload length]);
                 }
             }
         } @catch (NSException *e) {
-            FZ(@"FckZck 1.24: auto-finish inspection exception=%@", e);
+            FZ(@"FckZck 1.25: auto-finish inspection exception=%@", e);
         }
     }
 }
@@ -594,17 +594,24 @@ static BOOL new_isInit(id self, SEL _cmd) {
 static void (*orig_runWhen)(id, SEL, id);
 static void new_runWhen(id self, SEL _cmd, id blk) {
     FZ(@"FckZck: HistorySyncCompanionService.runWhenInitialSyncFinished: called (block=%@)", blk ? @"yes" : @"nil");
-    if (gForceInitialSyncFinished && blk) {
-        FZ(@"FckZck 1.24: compatibility path executing initial-sync continuation block directly");
-        @try {
-            void (^continuation)(void) = (void (^)(void))blk;
-            continuation();
-            FZ(@"FckZck 1.24: initial-sync continuation block executed");
-        } @catch (NSException *e) {
-            FZ(@"FckZck 1.24: continuation exception=%@; falling back to original", e);
-            orig_runWhen(self, _cmd, blk);
+    if (blk) {
+        BOOL realFinished = NO;
+        @try { realFinished = orig_isInit ? orig_isInit(self, sel_registerName("isInitialSyncFinished")) : NO; } @catch (NSException *e) {}
+        if (!realFinished) {
+            // This is the exact deadlock observed on iOS 12: the continuation is
+            // registered, but the Swift HistorySyncDevice never flips the state.
+            gForceInitialSyncFinished = YES;
+            FZ(@"FckZck 1.25: runWhenInitialSyncFinished while state=0; executing continuation directly");
+            @try {
+                void (^continuation)(void) = (void (^)(void))blk;
+                continuation();
+                FZ(@"FckZck 1.25: initial-sync continuation executed");
+            } @catch (NSException *e) {
+                FZ(@"FckZck 1.25: continuation exception=%@; falling back to original", e);
+                orig_runWhen(self, _cmd, blk);
+            }
+            return;
         }
-        return;
     }
     orig_runWhen(self, _cmd, blk);
 }
@@ -906,7 +913,7 @@ static BOOL FZInstallSignalHooks(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.18.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.25 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
