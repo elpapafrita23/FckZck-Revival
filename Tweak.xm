@@ -1020,6 +1020,112 @@ static void FZHookPropsSetter(Class c, SEL sel) {
     FZ(@"FckZck 1.27: hooked %s %s", class_getName(c), sel_getName(sel));
 }
 
+// ---- 1.27.2: hook the CompanionProps model classes themselves ---------------
+// Log 3: setCompanionProps: on the RegData/DeviceInfo classes never fired (props are not set
+// through them while pairing). The classes WAPBCompanionProps / _AppVersion / _HistorySyncConfig
+// do exist, so we hook their setters and getters too.
+static BOOL FZHookB(Class c, const char *sel, const char *types, IMP (^mk)(IMP *slot, SEL s)) {
+    SEL s = sel_registerName(sel);
+    Method m = class_getInstanceMethod(c, s);
+    if (!m) { FZ(@"FckZck 1.27: %s has no %s", class_getName(c), sel); return NO; }
+    const char *e = method_getTypeEncoding(m);
+    const char *p = e ? strstr(e, "@0:8") : NULL;
+    if (!p || !p[4] || !strchr(types, p[4])) { FZ(@"FckZck 1.27: %s %s unexpected type %s", class_getName(c), sel, e ? e : "?"); return NO; }
+    IMP *slot = (IMP *)calloc(1, sizeof(IMP));
+    MSHookMessageEx(c, s, mk(slot, s), slot);
+    FZ(@"FckZck 1.27: hooked %s %s (%s)", class_getName(c), sel, e);
+    return YES;
+}
+static void FZSetKV(id o, NSString *k, id v) {
+    @try { [o setValue:v forKey:k]; FZ(@"FckZck 1.27: %@=%@ (now %@)", k, v, [o valueForKey:k]); }
+    @catch (NSException *e) { FZ(@"FckZck 1.27: cannot set %@: %@", k, e.reason); }
+}
+static void FZTuneProps(id p) {
+    static BOOL busy = NO;
+    if (busy || !p) return;
+    busy = YES;
+    @try {
+        id cfg = nil;
+        @try { cfg = [p valueForKey:@"historySyncConfig"]; } @catch (NSException *e) { cfg = nil; }
+        Class cc = objc_getClass("WAPBCompanionProps_HistorySyncConfig");
+        if (!cfg && cc) { cfg = [[cc alloc] init]; FZSetKV(p, @"historySyncConfig", cfg); }
+        FZSetKV(p, @"requireFullSync", @(gReqFullSync));
+        if (cfg) {
+            FZSetKV(cfg, @"fullSyncDaysLimit", @(gHistDays));
+            FZSetKV(cfg, @"recentSyncDaysLimit", @(gHistDays));
+            FZSetKV(cfg, @"fullSyncSizeMbLimit", @(1024));
+            FZSetKV(cfg, @"storageQuotaMb", @(10240));
+        } else FZ(@"FckZck 1.27: no historySyncConfig object");
+    } @catch (NSException *e) { FZ(@"FckZck 1.27: tune exception %@", e); }
+    busy = NO;
+}
+static void FZListSel(const char *cn) {
+    Class c = objc_getClass(cn);
+    if (!c) return;
+    unsigned int n = 0; Method *ms = class_copyMethodList(c, &n);
+    NSMutableArray *a = [NSMutableArray array];
+    for (unsigned int i = 0; i < n; i++) { const char *x = sel_getName(method_getName(ms[i])); if (x[0] != '.') [a addObject:@(x)]; }
+    free(ms);
+    FZ(@"FckZck 1.27: methods of %s: %@", cn, [a componentsJoinedByString:@" "]);
+}
+static BOOL gCompHooked = NO;
+static void FZInstallCompanionHooks(void) {
+    if (gCompHooked) return;
+    Class av = objc_getClass("WAPBCompanionProps_AppVersion");
+    Class cp = objc_getClass("WAPBCompanionProps");
+    if (!av || !cp) return;
+    gCompHooked = YES;
+    FZListSel("WAPBCompanionProps"); FZListSel("WAPBCompanionProps_HistorySyncConfig");
+    FZListSel("WAPBClientPayload_CompanionRegData"); FZListSel("WAPBCompanionDeviceInfo");
+    const char *names[] = {"setPrimary:", "setSecondary:", "setTertiary:", "setQuaternary:"};
+    for (int i = 0; i < 4; i++) {
+        int idx = i;
+        FZHookB(av, names[i], "Ii", ^IMP(IMP *slot, SEL s) {
+            return imp_implementationWithBlock(^(id self, unsigned int v) {
+                ((void (*)(id, SEL, unsigned int))*slot)(self, s, (unsigned int)gNum[idx]);
+            });
+        });
+    }
+    FZHookB(cp, "setRequireFullSync:", "B", ^IMP(IMP *slot, SEL s) {
+        return imp_implementationWithBlock(^(id self, BOOL v) {
+            ((void (*)(id, SEL, BOOL))*slot)(self, s, (BOOL)gReqFullSync);
+        });
+    });
+    FZHookB(cp, "setPlatformType:", "Ii", ^IMP(IMP *slot, SEL s) {
+        return imp_implementationWithBlock(^(id self, unsigned int v) {
+            ((void (*)(id, SEL, unsigned int))*slot)(self, s, v);
+            FZ(@"FckZck 1.27: CompanionProps.setPlatformType(%u)", v);
+            FZTuneProps(self);
+        });
+    });
+    FZHookB(cp, "setHistorySyncConfig:", "@", ^IMP(IMP *slot, SEL s) {
+        return imp_implementationWithBlock(^(id self, id v) {
+            ((void (*)(id, SEL, id))*slot)(self, s, v);
+            FZTuneProps(self);
+        });
+    });
+    FZHookB(cp, "setVersion:", "@", ^IMP(IMP *slot, SEL s) {
+        return imp_implementationWithBlock(^(id self, id v) {
+            ((void (*)(id, SEL, id))*slot)(self, s, v);
+            FZTuneProps(self);
+        });
+    });
+    // Getter fallback: whoever reads the NSData gets the rewritten bytes.
+    const char *cls[] = {"WAPBClientPayload_CompanionRegData", "WAPBCompanionDeviceInfo"};
+    for (int i = 0; i < 2; i++) {
+        Class c = objc_getClass(cls[i]);
+        if (!c) continue;
+        FZHookB(c, "companionProps", "@", ^IMP(IMP *slot, SEL s) {
+            return imp_implementationWithBlock(^id(id self) {
+                id r = ((id (*)(id, SEL))*slot)(self, s);
+                FZ(@"FckZck 1.27: %s.companionProps read (%@)", class_getName([self class]), r ? NSStringFromClass([r class]) : @"nil");
+                if ([r isKindOfClass:[NSData class]]) return FZTuneDevicePropsData((NSData *)r);
+                return r;
+            });
+        });
+    }
+}
+
 static int gPropsHooks = 0;
 static NSMutableSet *gPropsSeen;
 static void FZScanDeviceProps(void) {
@@ -1051,6 +1157,7 @@ static void FZScanDeviceProps(void) {
 }
 static void FZScanLoop(int left) {
     FZScanDeviceProps();
+    FZInstallCompanionHooks();
     if (left > 0) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ FZScanLoop(left - 1); });
     else FZ(@"FckZck 1.27: scan finished, hooks=%d", gPropsHooks);
 }
@@ -1058,7 +1165,7 @@ static void FZScanLoop(int left) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.27.1 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.27.2 compatibility build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -1085,6 +1192,7 @@ static void FZScanLoop(int left) {
         });
     }
     FZScanLoop(45);
+    FZDumpClassesMatching(@[@"CompanionProps", @"CompanionRegData", @"CompanionDeviceInfo"], @"fckzck-companion-classes.txt");
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSString *frameworkPath = [bundlePath stringByAppendingPathComponent:@"Frameworks/SharedModules.framework/SharedModules"];
     MSImageRef image = MSGetImageByName([frameworkPath UTF8String]);
