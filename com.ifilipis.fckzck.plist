@@ -4,5 +4,7 @@
 <dict>
 	<key>version</key>
 	<string>2.26.38.74</string>
+	<key>skipEmptyRefCert</key>
+	<true/>
 </dict>
 </plist>
