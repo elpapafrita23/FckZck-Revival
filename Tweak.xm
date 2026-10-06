@@ -36,7 +36,8 @@ static BOOL gLidFallback = YES;
 // Config key: forceFinishBootstrapSeconds (integer).
 static int gForceFinishSeconds = 0;  // 1.20 diagnostic: do not synthesize bootstrap completion.
 // 1.19 test: make the companion service report initial history sync as finished.
-static BOOL gForceInitialSyncFinished = NO;  // 1.20 diagnostic: observe the real service state.
+static BOOL gForceInitialSyncFinished = NO;  // 1.20 diagnostic / compatibility override.
+static BOOL gAutoFinishInitialBootstrap = YES; // 1.24: iOS 12 compatibility once INITIAL_BOOTSTRAP is actually received.
 static BOOL gInitialCalled = NO;
 static BOOL gSecCalled = NO;
 static __weak id gHistSvc = nil;
@@ -411,9 +412,6 @@ static void new_hsFailure(id self, SEL _cmd, id reason) {
     }
 }
 
-static void FZLogHistoryServiceObjects(id self, NSString *phase);
-static BOOL (*orig_isInit)(id, SEL);
-
 static void (*orig_hsHandle)(id, SEL, id, id);
 static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
     gHistSvc = self;
@@ -434,32 +432,30 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
         }
         FZ(@"%@", line);
     } @catch (NSException *e) {}
-    // Capture the service state immediately before and after processing this message.
-    // Do not call the hooked selector here; use the original IMP to avoid recursive logging.
-    @try {
-        if (orig_isInit) {
-            BOOL before = orig_isInit(self, sel_registerName("isInitialSyncFinished"));
-            FZ(@"FckZck: HistorySyncService.handleMessage BEFORE service.isInitialSyncFinished=%d", before);
-        }
-    } @catch (NSException *e) {
-        FZ(@"FckZck: HistorySyncService.handleMessage BEFORE state read exception=%@", e);
-    }
-
-    FZLogHistoryServiceObjects(self, @"BEFORE");
     orig_hsHandle(self, _cmd, msg, stanza);
-    FZLogHistoryServiceObjects(self, @"AFTER");
 
-    @try {
-        if (orig_isInit) {
-            BOOL after = orig_isInit(self, sel_registerName("isInitialSyncFinished"));
-            FZ(@"FckZck: HistorySyncService.handleMessage AFTER service.isInitialSyncFinished=%d", after);
+    // On iOS 12 the modern history-sync payload is received and accepted, but the
+    // Swift HistorySyncDevice never transitions to isInitialSyncFinished=YES.
+    // The log shows this immediately: INITIAL_BOOTSTRAP arrives, handleMessage
+    // returns, and later runWhenInitialSyncFinished still sees 0.  Once the real
+    // INITIAL_BOOTSTRAP has been delivered, allow the companion continuation to
+    // proceed instead of waiting forever for the missing Swift state transition.
+    if (gAutoFinishInitialBootstrap) {
+        @try {
+            id syncType = [msg valueForKeyPath:@"historySyncNotification.syncType"];
+            id inlinePayload = [msg valueForKeyPath:@"historySyncNotification.initialHistBootstrapInlinePayload"];
+            if ([syncType respondsToSelector:@selector(integerValue)] &&
+                [syncType integerValue] == 0 &&
+                [inlinePayload respondsToSelector:@selector(length)] &&
+                [inlinePayload length] > 0) {
+                if (!gForceInitialSyncFinished) {
+                    gForceInitialSyncFinished = YES;
+                    FZ(@"FckZck 1.24: INITIAL_BOOTSTRAP received (%lu bytes); enabling compatibility completion", (unsigned long)[inlinePayload length]);
+                }
+            }
+        } @catch (NSException *e) {
+            FZ(@"FckZck 1.24: auto-finish inspection exception=%@", e);
         }
-        if ([self respondsToSelector:sel_registerName("currentSyncState")]) {
-            id state = [self valueForKey:@"currentSyncState"];
-            FZ(@"FckZck: HistorySyncService.handleMessage AFTER currentSyncState=%@", state);
-        }
-    } @catch (NSException *e) {
-        FZ(@"FckZck: HistorySyncService.handleMessage AFTER state read exception=%@", e);
     }
 }
 
@@ -539,24 +535,6 @@ static void new_pairingTimedOut(id self, SEL _cmd, id notification) {
     orig_pairingTimedOut(self, _cmd, notification);
 }
 
-static void FZLogHistoryServiceObjects(id self, NSString *phase) {
-    @try {
-        NSArray *keys = @[@"historySyncDevice", @"device", @"initialSyncState", @"syncState", @"stateUpdate"];
-        for (NSString *key in keys) {
-            id value = nil;
-            @try { value = [self valueForKey:key]; } @catch (NSException *e) { continue; }
-            if (value) {
-                FZ(@"FckZck: HistorySyncService.%@ KVC %@ -> class=%@ desc=%@", phase, key, NSStringFromClass([value class]), FZDesc(value));
-                @try {
-                    if ([value respondsToSelector:sel_registerName("isInitialSyncFinished")]) FZ(@"FckZck: HistorySyncService.%@ %@.isInitialSyncFinished=%d", phase, key, (int)((BOOL (*)(id,SEL))objc_msgSend)(value, sel_registerName("isInitialSyncFinished")));
-                    if ([value respondsToSelector:sel_registerName("isSyncing")]) FZ(@"FckZck: HistorySyncService.%@ %@.isSyncing=%d", phase, key, (int)((BOOL (*)(id,SEL))objc_msgSend)(value, sel_registerName("isSyncing")));
-                    if ([value respondsToSelector:sel_registerName("isCompleted")]) FZ(@"FckZck: HistorySyncService.%@ %@.isCompleted=%d", phase, key, (int)((BOOL (*)(id,SEL))objc_msgSend)(value, sel_registerName("isCompleted")));
-                } @catch (NSException *e) {}
-            }
-        }
-    } @catch (NSException *e) {}
-}
-
 static BOOL FZInstallDiagnosticHistoryHooks(void) {
     Class device = objc_getClass("WAHistorySync.HistorySyncDevice");
     if (!device) device = objc_getClass("_TtC13WAHistorySync17HistorySyncDevice");
@@ -602,6 +580,7 @@ static BOOL FZHookIfPresent(Class c, const char *selName, const char *wantEnc, I
 @end
 
 // WAHistorySyncCompanionService: ObjC surface seen in log 5 (everything else is Swift).
+static BOOL (*orig_isInit)(id, SEL);
 static BOOL new_isInit(id self, SEL _cmd) {
     BOOL r = orig_isInit(self, _cmd);
     static int last = -1;
@@ -615,6 +594,18 @@ static BOOL new_isInit(id self, SEL _cmd) {
 static void (*orig_runWhen)(id, SEL, id);
 static void new_runWhen(id self, SEL _cmd, id blk) {
     FZ(@"FckZck: HistorySyncCompanionService.runWhenInitialSyncFinished: called (block=%@)", blk ? @"yes" : @"nil");
+    if (gForceInitialSyncFinished && blk) {
+        FZ(@"FckZck 1.24: compatibility path executing initial-sync continuation block directly");
+        @try {
+            void (^continuation)(void) = (void (^)(void))blk;
+            continuation();
+            FZ(@"FckZck 1.24: initial-sync continuation block executed");
+        } @catch (NSException *e) {
+            FZ(@"FckZck 1.24: continuation exception=%@; falling back to original", e);
+            orig_runWhen(self, _cmd, blk);
+        }
+        return;
+    }
     orig_runWhen(self, _cmd, blk);
 }
 static void (*orig_didUpdAB)(id, SEL);
