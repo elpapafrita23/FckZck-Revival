@@ -15,9 +15,9 @@ WhatsApp keeps raising its minimum requirements. On an old iPhone you hit two wa
 
 ## What does it do?
 
-- Reports a recent app version (`2.26.38.74`) to the server, with a build hash that matches that version, so the two are consistent.
+- Reports a recent app version (default `2.26.38.74`, **configurable**, see below) to the server, with a build hash that is always the MD5 of that version string, so the two are consistent.
 - Overrides the app expiration, build date and deprecated-platform cut-off dates.
-- **New in 1.1.0:** disables the *deprecated platform* check (`WAIsPlatformDeprecated` and `WAShouldShowPlatformDeprecationNags`), which the original author left as a commented-out "Somebody please fix this". The fix is looking the symbols up inside the `SharedModules` framework image (with the leading underscore) instead of using a `NULL` image.
+- **1.1.0:** disables the *deprecated platform* check (`WAIsPlatformDeprecated` and `WAShouldShowPlatformDeprecationNags`), which the original author left as a commented-out "Somebody please fix this". The fix is looking the symbols up inside the `SharedModules` framework image (with the leading underscore) instead of using a `NULL` image.
 - Disables the in-app "build expired" check.
 - Works for WhatsApp and WhatsApp Business (including their notification and service extensions).
 
@@ -35,6 +35,27 @@ WhatsApp keeps raising its minimum requirements. On an old iPhone you hit two wa
 4. Force-quit WhatsApp, respring, and open it.
 
 Also recommended: turn off automatic App Store updates so WhatsApp is not replaced by a newer version your device can't run.
+
+## Configuration
+
+Since 1.2.0 the spoofed version can be changed **without recompiling**. The package installs
+
+`/var/mobile/Library/Preferences/com.ifilipis.fckzck.plist`
+
+```xml
+<key>version</key>
+<string>2.26.38.74</string>
+```
+
+Edit the string (Filza works), force-quit WhatsApp and open it again. No respring needed. Accepted formats: `2.26.38.74` (four parts) or `26.38.74` (three parts, a leading `2` is added). If the file is missing or invalid, the default is used.
+
+## Debug log
+
+The tweak writes `fckzck.log` to the WhatsApp app container (`Documents/`), reset on every launch. It contains the tweak's own lines (which hooks worked, which version was applied) plus the WhatsApp internal log lines about connection, pairing/linking, crypto and errors. Search for it with Filza. It may contain account identifiers, so redact it before sharing.
+
+## Known limitations
+
+- **Linking new devices does not work** on old WhatsApp builds, with this tweak or without it. Scanning a QR makes the server answer `400 bad-request`, and linking with a phone-number code fails on the phone with an AES-GCM decryption error. Both happen inside WhatsApp's own pairing code, which looks outdated compared to current companion clients. Changing the reported version does not seem to change this. Reports and ideas are welcome.
 
 ## Build from source
 
@@ -55,7 +76,7 @@ echo -n "2.26.38.74" | md5sum
 
 ## Roadmap
 
-- Make the spoofed version configurable without recompiling.
+- Find a way to make device linking work (see Known limitations).
 - Track WhatsApp's current version numbers and keep the defaults up to date.
 - Rootless jailbreak support.
 - Collect reports of which iOS / WhatsApp combinations work.
