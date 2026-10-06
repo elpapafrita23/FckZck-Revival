@@ -419,12 +419,12 @@ static void new_hsFailure(id self, SEL _cmd, id reason) {
 }
 
 static void (*orig_hsHandle)(id, SEL, id, id);
+static NSUInteger gHSMessageCount = 0;
 static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
     gHistSvc = self;
     @try {
-        static NSUInteger hsMessageCount = 0;
-        hsMessageCount++;
-        NSMutableString *line = [NSMutableString stringWithFormat:@"FckZck: HistorySyncService.handleMessage #%lu class=%@", (unsigned long)hsMessageCount, NSStringFromClass([msg class])];
+        gHSMessageCount++;
+        NSMutableString *line = [NSMutableString stringWithFormat:@"FckZck: HistorySyncService.handleMessage #%lu class=%@", (unsigned long)gHSMessageCount, NSStringFromClass([msg class])];
         NSArray *paths = @[@"type",
                            @"historySyncNotification.syncType",
                            @"historySyncNotification.chunkOrder",
@@ -445,7 +445,7 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
     } @catch (NSException *e) {}
     orig_hsHandle(self, _cmd, msg, stanza);
     @try {
-        FZ(@"FckZck: HistorySyncService.handleMessage #%lu AFTER isInitialSyncFinished=%d", (unsigned long)hsMessageCount, (int)[self isInitialSyncFinished]);
+        FZ(@"FckZck: HistorySyncService.handleMessage #%lu AFTER isInitialSyncFinished=%d", (unsigned long)gHSMessageCount, (int)[self isInitialSyncFinished]);
     } @catch (NSException *e) {}
 }
 
