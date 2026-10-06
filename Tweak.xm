@@ -16,6 +16,14 @@ static int gNum[4] = {2, 26, 38, 74};
 // Config key: <key>skipEmptyRefCert</key><true/> to turn it on.
 static NSString *gHistoryMode = @"continue";
 static NSNumber *gForceSyncState = nil;
+// Experiment (1.11): the app logs itself out ~120 s after pairing because history sync never
+// completes (reason "history_sync_timeout"). When ON, that single logout is swallowed and the
+// bootstrap is told the initial history sync finished instead.
+// Config keys: blockHistoryTimeoutLogout (bool, default ON),
+//              historyTimeoutRemovalReason (integer, default 11 = value seen in log 2).
+static BOOL gBlockHistoryTimeoutLogout = YES;
+static long long gBlockLogoutReason = 11;
+static __weak id gBootObj = nil;
 static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping did not fix the 400)
 // Experiment: OS version declared to the server in ClientPayload.UserAgent.
 // Config keys (strings): osVersion, osBuildNumber. An EMPTY osVersion disables
@@ -68,6 +76,11 @@ static void FZLoadConfig(void) {
     NSString *v = cfg[@"version"];
     id skip = cfg[@"skipEmptyRefCert"];
     if ([skip respondsToSelector:@selector(boolValue)]) gSkipEmptyRefCert = [skip boolValue];
+    id bl = cfg[@"blockHistoryTimeoutLogout"];
+    if ([bl respondsToSelector:@selector(boolValue)]) gBlockHistoryTimeoutLogout = [bl boolValue];
+    id br = cfg[@"historyTimeoutRemovalReason"];
+    if ([br isKindOfClass:[NSNumber class]]) gBlockLogoutReason = [br longLongValue];
+    FZ(@"FckZck: blockHistoryTimeoutLogout=%d reason=%lld", gBlockHistoryTimeoutLogout, gBlockLogoutReason);
     id hm = cfg[@"historySyncFailureMode"];
     if ([hm isKindOfClass:[NSString class]] && [(NSString *)hm length]) gHistoryMode = hm;
     FZ(@"FckZck: historySyncFailureMode=%@", gHistoryMode);
@@ -399,9 +412,50 @@ static BOOL FZHookIfPresent(Class c, const char *selName, const char *wantEnc, I
     return YES;
 }
 
+// Remember the live CompanionBootstrapLoading object (it is called during pairing,
+// well before the 120 s timeout fires).
+static void (*orig_critBlock)(id, SEL, id);
+static void new_critBlock(id self, SEL _cmd, id arg) {
+    gBootObj = self;
+    orig_critBlock(self, _cmd, arg);
+}
+
+// WAAccountCleaner logout entry points. The timeout path in log 2 went through
+// logoutAuthenticatedCompanionWithReason (".../normal/11").
+static void (*orig_logoutAuth)(id, SEL, long long, BOOL, id);
+static void new_logoutAuth(id self, SEL _cmd, long long reason, BOOL restart, id ctx) {
+    FZ(@"FckZck: WAAccountCleaner.logoutAuthenticatedCompanion reason=%lld restart=%d", reason, restart);
+    if (gBlockHistoryTimeoutLogout && reason == gBlockLogoutReason) {
+        id boot = gBootObj;
+        if (boot && orig_hsInitial) {
+            FZ(@"FckZck: -> logout blocked, telling bootstrap the initial history sync finished");
+            orig_hsInitial(boot, sel_registerName("handleInitialHistorySync"));
+        } else {
+            FZ(@"FckZck: -> logout blocked (no bootstrap object captured, nothing else to do)");
+        }
+        return;
+    }
+    orig_logoutAuth(self, _cmd, reason, restart, ctx);
+}
+
+static void (*orig_logoutComp)(id, SEL, long long, id, id);
+static void new_logoutComp(id self, SEL _cmd, long long reason, id ctx, id completion) {
+    FZ(@"FckZck: WAAccountCleaner.logoutCompanionWithReason reason=%lld", reason);
+    orig_logoutComp(self, _cmd, reason, ctx, completion);
+}
+
+static BOOL gCleanerHooked = NO;
 static BOOL gHistoryHooksDone = NO;
 static BOOL FZInstallHistoryHooks(void) {
     if (gHistoryHooksDone) return YES;
+    if (!gCleanerHooked) {
+        Class cleaner = objc_getClass("WAAccountCleaner");
+        if (cleaner) {
+            FZHookIfPresent(cleaner, "logoutAuthenticatedCompanionWithReason:shouldRestartIfPossible:userContext:", "v36@0:8q16B24@28", (IMP)new_logoutAuth, (IMP *)&orig_logoutAuth);
+            FZHookIfPresent(cleaner, "logoutCompanionWithReason:userContext:completion:", "v40@0:8q16@24@?32", (IMP)new_logoutComp, (IMP *)&orig_logoutComp);
+            gCleanerHooked = YES;
+        } else FZ(@"FckZck: WAAccountCleaner not found yet");
+    }
     Class boot = objc_getClass("WACompanionRegistration.CompanionBootstrapLoading");
     if (!boot) boot = objc_getClass("_TtC23WACompanionRegistration25CompanionBootstrapLoading");
     Class ui = objc_getClass("WAHistorySync.HistorySyncCompanionUserInterfaceController");
@@ -414,6 +468,7 @@ static BOOL FZInstallHistoryHooks(void) {
     if (boot) {
         FZHookIfPresent(boot, "handleInitialHistorySync", "v16@0:8", (IMP)new_hsInitial, (IMP *)&orig_hsInitial);
         FZHookIfPresent(boot, "handleHistorySyncFailure:", "v24@0:8@16", (IMP)new_hsFailure, (IMP *)&orig_hsFailure);
+        FZHookIfPresent(boot, "handleSyncdCriticalBlockCollection:", "v24@0:8@16", (IMP)new_critBlock, (IMP *)&orig_critBlock);
     } else FZ(@"FckZck: CompanionBootstrapLoading not found");
     if (svc) FZHookIfPresent(svc, "handleMessage:stanza:", "v32@0:8@16@24", (IMP)new_hsHandle, (IMP *)&orig_hsHandle);
     else FZ(@"FckZck: WAHistorySyncCompanionService not found");
@@ -425,14 +480,14 @@ static BOOL FZInstallHistoryHooks(void) {
 
 %ctor {
     FZLoadConfig();
-    FZ(@"FckZck 1.10.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.11.0 loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!FZInstallUserAgentHooks()) FZ(@"FckZck: WAPBClientPayload_UserAgent still not found");
         });
     }
-    FZDumpClassesMatching(@[@"Logout", @"AccountCleaner", @"RemovalReason", @"OwnDevice", @"Bootstrap", @"HistorySync", @"SyncState"], @"fckzck-classes2.txt");
+    FZDumpClassesMatching(@[@"Signal", @"PreKey", @"Prekey", @"Session", @"Encrypt", @"Decrypt", @"IdentityKey", @"Keychain"], @"fckzck-classes3.txt");
     if (!FZInstallHistoryHooks()) {
         FZ(@"FckZck: history-sync classes not found yet, retrying in 3s and 10s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -468,7 +523,7 @@ static BOOL FZInstallHistoryHooks(void) {
 	static NSArray *keys;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
-		keys = @[@"md/", @"pair", @"link", @"companion", @"gcm", @"xmpp//", @"stream//", @"LL_E", @"LL_W", @"login", @"auth", @"deprecat", @"expire", @"version"];
+		keys = @[@"md/", @"pair", @"link", @"companion", @"gcm", @"xmpp//", @"stream//", @"LL_E", @"LL_W", @"login", @"auth", @"deprecat", @"expire", @"version", @"signal", @"prekey", @"history-sync", @"logout"];
 	});
 	for (NSString *k in keys) {
 		if ([result rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) {
