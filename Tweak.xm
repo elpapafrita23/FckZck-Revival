@@ -445,7 +445,7 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
     } @catch (NSException *e) {}
     orig_hsHandle(self, _cmd, msg, stanza);
     @try {
-        FZ(@"FckZck: HistorySyncService.handleMessage #%lu AFTER isInitialSyncFinished=%d", (unsigned long)gHSMessageCount, (int)[self isInitialSyncFinished]);
+        FZ(@"FckZck: HistorySyncService.handleMessage #%lu AFTER", (unsigned long)gHSMessageCount);
     } @catch (NSException *e) {}
 }
 
