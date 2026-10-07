@@ -1191,7 +1191,6 @@ static BOOL FZInstallFullHistoryPropsHooks(void) {
         }
         if (deviceCandidate && !orig_requireFullSync) {
             Method m = class_getInstanceMethod(c, sel_registerName("requireFullSync"));
-            const char *enc = m ? method_getTypeEncoding(m) : NULL;
             if (m && FZMethodReturnsBool(m)) {
                 MSHookMessageEx(c, sel_registerName("requireFullSync"), (IMP)new_requireFullSync, (IMP *)&orig_requireFullSync);
                 hookedAny = YES;
