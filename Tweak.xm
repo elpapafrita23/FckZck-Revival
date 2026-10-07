@@ -55,6 +55,11 @@ static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping 
 // the override (the real iOS version is sent).
 static NSString *gOsVersion = nil;
 static NSString *gOsBuild = nil;
+// 1.31: keep the working 26.38.74 advertisement. The lower 2.25.15.23
+// compatibility experiment made this old client unstable/crash, so it is disabled.
+// We retain only the fresh History Sync .enc download/Range compatibility hooks.
+static BOOL gUseHistoryCompatVersion = NO;
+static BOOL gForceFreshHistoryDownload = YES;
 
 // ---- File logging -------------------------------------------------------
 // Writes to <app Documents>/fckzck.log (and NSLog). Lets you read the log with
@@ -121,6 +126,11 @@ static void FZLoadConfig(void) {
     NSString *wanted = DEFAULT_VERSION;
     NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.ifilipis.fckzck.plist"];
     NSString *v = cfg[@"version"];
+    // 1.31: force the known-working advertised version. Do not allow the old
+    // historyCompatVersion experiment (2.25.15.23) to override it.
+    gUseHistoryCompatVersion = NO;
+    id fresh = cfg[@"forceFreshHistoryDownload"];
+    if ([fresh respondsToSelector:@selector(boolValue)]) gForceFreshHistoryDownload = [fresh boolValue];
     id skip = cfg[@"skipEmptyRefCert"];
     if ([skip respondsToSelector:@selector(boolValue)]) gSkipEmptyRefCert = [skip boolValue];
     // 1.26: the 120 s history_sync_timeout logout is blocked by default (plist key
@@ -133,7 +143,7 @@ static void FZLoadConfig(void) {
     // 1.29: the registration gate is bypassed as in 1.28. In addition, once a real
     // INITIAL_BOOTSTRAP has been consumed, only the bootstrap UI steps are released.
     // The HistorySync service completion bit is NEVER spoofed.
-    FZ(@"FckZck 1.29: registration-gate bypass + post-INITIAL_BOOTSTRAP UI release enabled");
+    FZ(@"FckZck 1.31: registration-gate bypass + post-INITIAL_BOOTSTRAP UI release enabled");
     id so = cfg[@"signalDeprecatedOverride"];
     if ([so isKindOfClass:[NSNumber class]]) gDeprecatedOverride = [so intValue];
     FZ(@"FckZck: signalDeprecatedOverride=%d", gDeprecatedOverride);
@@ -146,15 +156,21 @@ static void FZLoadConfig(void) {
     FZ(@"FckZck 1.25: historySyncFailureMode=%@ (fixed)", gHistoryMode);
     // 1.29: never spoof the initial-sync completion bit. The real service owns it.
     gForceInitialSyncFinished = NO;
-    FZ(@"FckZck 1.29: forceInitialSyncFinished=0 (completion spoof disabled)");
+    FZ(@"FckZck 1.31: forceInitialSyncFinished=0 (completion spoof disabled)");
     id fs = cfg[@"forceSyncState"];
     if ([fs isKindOfClass:[NSNumber class]]) { gForceSyncState = fs; FZ(@"FckZck: forceSyncState=%@", fs); } else { FZ(@"FckZck: forceSyncState default=%@", gForceSyncState); }
     // Never consume legacy osVersion/osBuildNumber plist overrides.
     gOsVersion = nil;
     gOsBuild = nil;
     FZ(@"FckZck 1.25: osVersion override=(off) osBuildNumber override=(off) (fixed)");
-    if ([v isKindOfClass:[NSString class]] && v.length) wanted = v;
-    else FZ(@"FckZck: no config found, using default version");
+    // 1.31: always advertise the version that is known to keep the app alive.
+    // A stale plist value must not silently put the client back on 2.25.15.23.
+    wanted = DEFAULT_VERSION;
+    FZ(@"FckZck 1.31: advertised version locked -> %@ (bundle short will be 26.38.74)", wanted);
+    if ([v isKindOfClass:[NSString class]] && v.length && ![v isEqualToString:wanted]) {
+        FZ(@"FckZck 1.31: ignoring plist version override %@ for stability", v);
+    }
+    FZ(@"FckZck 1.31: forceFreshHistoryDownload=%d", gForceFreshHistoryDownload);
 
     NSMutableArray *parts = [[wanted componentsSeparatedByString:@"."] mutableCopy];
     if (parts.count == 3) [parts insertObject:@"2" atIndex:0];
@@ -403,7 +419,7 @@ static BOOL FZInstallUserAgentHooks(void) {
 static void (*orig_hsInitial)(id, SEL);
 static void new_hsInitial(id self, SEL _cmd) {
     if (gInitialCalled) {
-        FZ(@"FckZck 1.29: duplicate handleInitialHistorySync suppressed");
+        FZ(@"FckZck 1.31: duplicate handleInitialHistorySync suppressed");
         return;
     }
     FZ(@"FckZck: CompanionBootstrapLoading.handleInitialHistorySync called");
@@ -443,6 +459,20 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
             if ([v isKindOfClass:[NSNumber class]]) [line appendFormat:@" %@=%@", kp, v];
         }
         FZ(@"%@", line);
+        @try {
+            id n = [msg valueForKey:@"historySyncNotification"];
+            if (n) {
+                for (NSString *k in @[@"directPath", @"fileSha256", @"fileEncSha256", @"mediaKey", @"initialHistBootstrapInlinePayload"]) {
+                    id v = nil;
+                    @try { v = [n valueForKey:k]; } @catch (NSException *e) { v = nil; }
+                    if (v) {
+                        NSUInteger len = 0;
+                        if ([v respondsToSelector:@selector(length)]) len = (NSUInteger)[v length];
+                        FZ(@"FckZck 1.31: history field %@ class=%@ len=%lu", k, NSStringFromClass([v class]), (unsigned long)len);
+                    }
+                }
+            }
+        } @catch (NSException *e) {}
     } @catch (NSException *e) {}
     // 1.26: decide BEFORE the original runs (it consumes the notification, which is why the
     // 1.25 check after the call never matched). hasInitialHistBootstrapInlinePayload is a
@@ -458,7 +488,7 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
 
     if (isBootstrapInline && !gBootstrapSeen) {
         gBootstrapSeen = YES;
-        FZ(@"FckZck 1.29: INITIAL_BOOTSTRAP consumed; scheduling bootstrap-UI release in %d s (history state remains real)",
+        FZ(@"FckZck 1.31: INITIAL_BOOTSTRAP consumed; scheduling bootstrap-UI release in %d s (history state remains real)",
            gBootstrapFinishDelaySeconds);
         if (!gBootstrapFinishScheduled) {
             gBootstrapFinishScheduled = YES;
@@ -610,10 +640,10 @@ static void new_runWhen(id self, SEL _cmd, id blk) {
             ? orig_isInit(self, sel_registerName("isInitialSyncFinished"))
             : NO;
     } @catch (NSException *e) {
-        FZ(@"FckZck 1.29: runWhenInitialSyncFinished state probe exception=%@", e);
+        FZ(@"FckZck 1.31: runWhenInitialSyncFinished state probe exception=%@", e);
     }
 
-    FZ(@"FckZck 1.29: HistorySyncCompanionService.runWhenInitialSyncFinished: block=%@ realFinished=%d",
+    FZ(@"FckZck 1.31: HistorySyncCompanionService.runWhenInitialSyncFinished: block=%@ realFinished=%d",
        blk ? @"yes" : @"nil", realFinished);
 
     // Old WhatsApp/iOS 12 pairing gets stuck (and can later be rejected/logged out)
@@ -622,13 +652,13 @@ static void new_runWhen(id self, SEL _cmd, id blk) {
     // leave gForceInitialSyncFinished == NO. The service itself must still report
     // unfinished until it has really consumed/imported its history payloads.
     if (!realFinished && blk) {
-        FZ(@"FckZck 1.29: bypassing registration gate WITHOUT marking history finished");
+        FZ(@"FckZck 1.31: bypassing registration gate WITHOUT marking history finished");
         void (^continuation)(void) = (void (^)(void))blk;
         @try {
             continuation();
-            FZ(@"FckZck 1.29: registration-gate continuation executed");
+            FZ(@"FckZck 1.31: registration-gate continuation executed");
         } @catch (NSException *e) {
-            FZ(@"FckZck 1.29: registration-gate continuation exception=%@", e);
+            FZ(@"FckZck 1.31: registration-gate continuation exception=%@", e);
         }
         return;
     }
@@ -653,7 +683,7 @@ static void new_resumeBg(id self, SEL _cmd) {
 static void (*orig_hsSec)(id, SEL);
 static void new_hsSec(id self, SEL _cmd) {
     if (gSecCalled) {
-        FZ(@"FckZck 1.29: duplicate handleSecurityNotificationSetting suppressed");
+        FZ(@"FckZck 1.31: duplicate handleSecurityNotificationSetting suppressed");
         return;
     }
     FZ(@"FckZck: CompanionBootstrapLoading.handleSecurityNotificationSetting called");
@@ -669,39 +699,39 @@ static void new_hsSec(id self, SEL _cmd) {
 static void FZReleaseBootstrapUI(const char *why) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gInitialCalled && gSecCalled) {
-            FZ(@"FckZck 1.29: releaseUI(%s): bootstrap UI already released", why);
+            FZ(@"FckZck 1.31: releaseUI(%s): bootstrap UI already released", why);
             return;
         }
 
         id boot = gBootObj;
         if (!boot || !orig_hsInitial) {
             if (gBootstrapFinishTries++ < 15) {
-                FZ(@"FckZck 1.29: releaseUI(%s): bootstrap object unavailable; retry in 1 s (%d)",
+                FZ(@"FckZck 1.31: releaseUI(%s): bootstrap object unavailable; retry in 1 s (%d)",
                    why, gBootstrapFinishTries);
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
                                dispatch_get_main_queue(), ^{
                     FZReleaseBootstrapUI(why);
                 });
             } else {
-                FZ(@"FckZck 1.29: releaseUI(%s): gave up waiting for bootstrap object", why);
+                FZ(@"FckZck 1.31: releaseUI(%s): gave up waiting for bootstrap object", why);
             }
             return;
         }
 
         if (gBootstrapFinishRunning) return;
         gBootstrapFinishRunning = YES;
-        FZ(@"FckZck 1.29: releaseUI(%s): initialCalled=%d secCalled=%d realHistoryFinished=%d",
+        FZ(@"FckZck 1.31: releaseUI(%s): initialCalled=%d secCalled=%d realHistoryFinished=%d",
            why, gInitialCalled, gSecCalled,
            (gHistSvc && orig_isInit) ? orig_isInit(gHistSvc, sel_registerName("isInitialSyncFinished")) : -1);
 
         @try {
             if (!gInitialCalled) {
                 gInitialCalled = YES;
-                FZ(@"FckZck 1.29: releasing bootstrap handleInitialHistorySync (UI gate only)");
+                FZ(@"FckZck 1.31: releasing bootstrap handleInitialHistorySync (UI gate only)");
                 orig_hsInitial(boot, sel_registerName("handleInitialHistorySync"));
             }
         } @catch (NSException *e) {
-            FZ(@"FckZck 1.29: handleInitialHistorySync exception=%@", e);
+            FZ(@"FckZck 1.31: handleInitialHistorySync exception=%@", e);
         }
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
@@ -709,11 +739,11 @@ static void FZReleaseBootstrapUI(const char *why) {
             @try {
                 if (!gSecCalled && orig_hsSec) {
                     gSecCalled = YES;
-                    FZ(@"FckZck 1.29: releasing bootstrap handleSecurityNotificationSetting (UI gate only)");
+                    FZ(@"FckZck 1.31: releasing bootstrap handleSecurityNotificationSetting (UI gate only)");
                     orig_hsSec(boot, sel_registerName("handleSecurityNotificationSetting"));
                 }
             } @catch (NSException *e) {
-                FZ(@"FckZck 1.29: handleSecurityNotificationSetting exception=%@", e);
+                FZ(@"FckZck 1.31: handleSecurityNotificationSetting exception=%@", e);
             }
             gBootstrapFinishRunning = NO;
         });
@@ -724,7 +754,7 @@ static void (*orig_critBlock)(id, SEL, id);
 static void new_critBlock(id self, SEL _cmd, id arg) {
     // Strongly retain the bootstrap coordinator while pairing is in progress.
     gBootObj = self;
-    FZ(@"FckZck 1.29: criticalBlockCollection callback; bootstrap object captured");
+    FZ(@"FckZck 1.31: criticalBlockCollection callback; bootstrap object captured");
     orig_critBlock(self, _cmd, arg);
 }
 
@@ -737,7 +767,7 @@ static void new_logoutAuth(id self, SEL _cmd, long long reason, BOOL restart, id
         // Do not destroy an otherwise authenticated companion because the iOS 12 history
         // state machine failed to release its UI gate. Release only the bootstrap UI; keep
         // the real history completion bit untouched so background sync may continue.
-        FZ(@"FckZck 1.29: -> history_sync_timeout logout blocked; releasing bootstrap UI only");
+        FZ(@"FckZck 1.31: -> history_sync_timeout logout blocked; releasing bootstrap UI only");
         FZReleaseBootstrapUI("history_sync_timeout blocked");
         return;
     }
@@ -972,6 +1002,74 @@ static BOOL FZInstallSignalHooks(void) {
 }
 // -------------------------------------------------------------------------
 
+
+// ---- 1.30: History Sync HTTP compatibility -------------------------------
+// iOS 12 / old WhatsApp repeatedly receives HTTP 416 for the external
+// history-sync .enc blob.  Force a fresh request by stripping Range only for
+// WhatsApp manual .enc downloads; leave normal media traffic untouched.
+static BOOL FZIsHistoryEncURL(NSURL *url) {
+    if (!url) return NO;
+    NSString *path = [[url path] lowercaseString];
+    NSString *query = [[url query] lowercaseString];
+    NSString *host = [[url host] lowercaseString];
+    if (![path hasSuffix:@".enc"]) return NO;
+    if ([host rangeOfString:@"whatsapp.net"].location == NSNotFound &&
+        [host rangeOfString:@"fbcdn.net"].location == NSNotFound) return NO;
+    return ([query rangeOfString:@"mode=manual"].location != NSNotFound);
+}
+
+static NSURLRequest *FZFreshHistoryRequest(NSURLRequest *req, NSString *where) {
+    if (!gForceFreshHistoryDownload || !req || !FZIsHistoryEncURL(req.URL)) return req;
+    NSString *range = [req valueForHTTPHeaderField:@"Range"];
+    FZ(@"FckZck 1.31: %@ history .enc request Range=%@ url=%@", where, range ?: @"(none)", req.URL.host);
+    NSMutableURLRequest *m = [req mutableCopy];
+    [m setValue:nil forHTTPHeaderField:@"Range"];
+    [m setCachePolicy:NSURLRequestReloadIgnoringLocalCacheData];
+    return m;
+}
+
+%hook NSMutableURLRequest
+- (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+    if (gForceFreshHistoryDownload && [field caseInsensitiveCompare:@"Range"] == NSOrderedSame && FZIsHistoryEncURL(self.URL)) {
+        FZ(@"FckZck 1.31: suppressing history Range header %@", value);
+        %orig(nil, field);
+        return;
+    }
+    %orig;
+}
+- (void)addValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+    if (gForceFreshHistoryDownload && [field caseInsensitiveCompare:@"Range"] == NSOrderedSame && FZIsHistoryEncURL(self.URL)) {
+        FZ(@"FckZck 1.31: suppressing added history Range header %@", value);
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook NSURLSession
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+    return %orig(FZFreshHistoryRequest(request, @"dataTask"));
+}
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    return %orig(FZFreshHistoryRequest(request, @"dataTask+completion"), completionHandler);
+}
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request {
+    return %orig(FZFreshHistoryRequest(request, @"downloadTask"));
+}
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURL *, NSURLResponse *, NSError *))completionHandler {
+    return %orig(FZFreshHistoryRequest(request, @"downloadTask+completion"), completionHandler);
+}
+- (NSURLSessionDownloadTask *)downloadTaskWithResumeData:(NSData *)resumeData {
+    FZ(@"FckZck 1.31: NSURLSession downloadTaskWithResumeData len=%lu", (unsigned long)resumeData.length);
+    return %orig;
+}
+- (NSURLSessionDownloadTask *)downloadTaskWithResumeData:(NSData *)resumeData completionHandler:(void (^)(NSURL *, NSURLResponse *, NSError *))completionHandler {
+    FZ(@"FckZck 1.31: NSURLSession downloadTaskWithResumeData+completion len=%lu", (unsigned long)resumeData.length);
+    return %orig;
+}
+%end
+// -------------------------------------------------------------------------
+
 // ---- Info.plist version spoof (CFBundleShortVersionString / CFBundleVersion) ----
 // Some in-app checks (e.g. "tu teléfono ya no es compatible" when sending) read the version from
 // the bundle's Info.plist. Make them report the spoofed version too (e.g. 26.38.74).
@@ -1039,7 +1137,7 @@ static CFTypeRef new_CFBundleGetValue(CFBundleRef b, CFStringRef key) {
         FZ(@"FckZck: bundle version spoof=%d -> %@ (real short=%@ build=%@)", gSpoofBundle, gBundleVer, real[@"CFBundleShortVersionString"], real[@"CFBundleVersion"]);
         MSHookFunction((void *)CFBundleGetValueForInfoDictionaryKey, (void *)new_CFBundleGetValue, (void **)&orig_CFBundleGetValue);
     }
-    FZ(@"FckZck 1.29 bootstrap-ui-release build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.31 version26-rangefix build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{

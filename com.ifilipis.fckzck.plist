@@ -3,6 +3,10 @@
 <plist version="1.0">
 <dict>
 	<key>version</key>
-	<string>2.26.38.74</string>
+	<string>2.25.15.23</string>
+	<key>historyCompatVersion</key>
+	<true/>
+	<key>forceFreshHistoryDownload</key>
+	<true/>
 </dict>
 </plist>
