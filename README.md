@@ -103,3 +103,7 @@ This is an unofficial project. It is not affiliated with, endorsed by, or connec
 
 - **ifilipis**, original author of FckZck.
 - **0xkuj**, author of blockWAUpdates, which the original project builds on.
+
+
+## 1.34
+Rewrites the serialized pairing `deviceProps` in the outbound `ClientPayload` so `requireFullSync` is actually present in the registration bytes. The `runWhenInitialSyncFinished:` compatibility bypass is now one-shot: only the first call (the stage 3 -> stage 4 registration gate) runs early; later callbacks remain stock and wait for real history completion. The six-second UI finish was replaced with an adaptive 25-second fallback, extended when FULL/RECENT chunks are observed.
