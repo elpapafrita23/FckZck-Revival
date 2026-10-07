@@ -60,8 +60,9 @@ static NSString *gOsBuild = nil;
 // We retain only the fresh History Sync .enc download/Range compatibility hooks.
 static BOOL gUseHistoryCompatVersion = NO;
 static BOOL gForceFreshHistoryDownload = YES;
-// 1.32: explicitly request FULL history in the companion DeviceProps sent at pair time.
-// Public WA companion protobufs expose requireFullSync + HistorySyncConfig for this purpose.
+// 1.33: explicitly request FULL history in the companion props sent at pair time.
+// The iOS protobuf class is WAPBCompanionProps (with nested
+// WAPBCompanionProps_HistorySyncConfig), not a class named DeviceProps.
 static BOOL gForceFullHistorySync = YES;
 static NSMutableSet<NSString *> *gHistoryDirectPaths = nil;
 
@@ -150,7 +151,7 @@ static void FZLoadConfig(void) {
     // 1.29: the registration gate is bypassed as in 1.28. In addition, once a real
     // INITIAL_BOOTSTRAP has been consumed, only the bootstrap UI steps are released.
     // The HistorySync service completion bit is NEVER spoofed.
-    FZ(@"FckZck 1.32: registration-gate bypass + post-INITIAL_BOOTSTRAP UI release enabled");
+    FZ(@"FckZck 1.33: registration-gate bypass + post-INITIAL_BOOTSTRAP UI release enabled");
     id so = cfg[@"signalDeprecatedOverride"];
     if ([so isKindOfClass:[NSNumber class]]) gDeprecatedOverride = [so intValue];
     FZ(@"FckZck: signalDeprecatedOverride=%d", gDeprecatedOverride);
@@ -163,7 +164,7 @@ static void FZLoadConfig(void) {
     FZ(@"FckZck 1.25: historySyncFailureMode=%@ (fixed)", gHistoryMode);
     // 1.29: never spoof the initial-sync completion bit. The real service owns it.
     gForceInitialSyncFinished = NO;
-    FZ(@"FckZck 1.32: forceInitialSyncFinished=0 (completion spoof disabled)");
+    FZ(@"FckZck 1.33: forceInitialSyncFinished=0 (completion spoof disabled)");
     id fs = cfg[@"forceSyncState"];
     if ([fs isKindOfClass:[NSNumber class]]) { gForceSyncState = fs; FZ(@"FckZck: forceSyncState=%@", fs); } else { FZ(@"FckZck: forceSyncState default=%@", gForceSyncState); }
     // Never consume legacy osVersion/osBuildNumber plist overrides.
@@ -173,12 +174,12 @@ static void FZLoadConfig(void) {
     // 1.31: always advertise the version that is known to keep the app alive.
     // A stale plist value must not silently put the client back on 2.25.15.23.
     wanted = DEFAULT_VERSION;
-    FZ(@"FckZck 1.32: advertised version locked -> %@ (bundle short will be 26.38.74)", wanted);
+    FZ(@"FckZck 1.33: advertised version locked -> %@ (bundle short will be 26.38.74)", wanted);
     if ([v isKindOfClass:[NSString class]] && v.length && ![v isEqualToString:wanted]) {
-        FZ(@"FckZck 1.32: ignoring plist version override %@ for stability", v);
+        FZ(@"FckZck 1.33: ignoring plist version override %@ for stability", v);
     }
-    FZ(@"FckZck 1.32: forceFreshHistoryDownload=%d (exact History directPath only)", gForceFreshHistoryDownload);
-    FZ(@"FckZck 1.32: forceFullHistorySync=%d", gForceFullHistorySync);
+    FZ(@"FckZck 1.33: forceFreshHistoryDownload=%d (exact History directPath only)", gForceFreshHistoryDownload);
+    FZ(@"FckZck 1.33: forceFullHistorySync=%d", gForceFullHistorySync);
 
     NSMutableArray *parts = [[wanted componentsSeparatedByString:@"."] mutableCopy];
     if (parts.count == 3) [parts insertObject:@"2" atIndex:0];
@@ -431,7 +432,7 @@ static BOOL FZInstallUserAgentHooks(void) {
 static void (*orig_hsInitial)(id, SEL);
 static void new_hsInitial(id self, SEL _cmd) {
     if (gInitialCalled) {
-        FZ(@"FckZck 1.32: duplicate handleInitialHistorySync suppressed");
+        FZ(@"FckZck 1.33: duplicate handleInitialHistorySync suppressed");
         return;
     }
     FZ(@"FckZck: CompanionBootstrapLoading.handleInitialHistorySync called");
@@ -486,7 +487,7 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
                     if (v) {
                         NSUInteger len = 0;
                         if ([v respondsToSelector:@selector(length)]) len = (NSUInteger)[v length];
-                        FZ(@"FckZck 1.32: history field %@ class=%@ len=%lu", k, NSStringFromClass([v class]), (unsigned long)len);
+                        FZ(@"FckZck 1.33: history field %@ class=%@ len=%lu", k, NSStringFromClass([v class]), (unsigned long)len);
                     }
                 }
             }
@@ -506,7 +507,7 @@ static void new_hsHandle(id self, SEL _cmd, id msg, id stanza) {
 
     if (isBootstrapInline && !gBootstrapSeen) {
         gBootstrapSeen = YES;
-        FZ(@"FckZck 1.32: INITIAL_BOOTSTRAP consumed; scheduling bootstrap-UI release in %d s (history state remains real)",
+        FZ(@"FckZck 1.33: INITIAL_BOOTSTRAP consumed; scheduling bootstrap-UI release in %d s (history state remains real)",
            gBootstrapFinishDelaySeconds);
         if (!gBootstrapFinishScheduled) {
             gBootstrapFinishScheduled = YES;
@@ -658,10 +659,10 @@ static void new_runWhen(id self, SEL _cmd, id blk) {
             ? orig_isInit(self, sel_registerName("isInitialSyncFinished"))
             : NO;
     } @catch (NSException *e) {
-        FZ(@"FckZck 1.32: runWhenInitialSyncFinished state probe exception=%@", e);
+        FZ(@"FckZck 1.33: runWhenInitialSyncFinished state probe exception=%@", e);
     }
 
-    FZ(@"FckZck 1.32: HistorySyncCompanionService.runWhenInitialSyncFinished: block=%@ realFinished=%d",
+    FZ(@"FckZck 1.33: HistorySyncCompanionService.runWhenInitialSyncFinished: block=%@ realFinished=%d",
        blk ? @"yes" : @"nil", realFinished);
 
     // Old WhatsApp/iOS 12 pairing gets stuck (and can later be rejected/logged out)
@@ -670,13 +671,13 @@ static void new_runWhen(id self, SEL _cmd, id blk) {
     // leave gForceInitialSyncFinished == NO. The service itself must still report
     // unfinished until it has really consumed/imported its history payloads.
     if (!realFinished && blk) {
-        FZ(@"FckZck 1.32: bypassing registration gate WITHOUT marking history finished");
+        FZ(@"FckZck 1.33: bypassing registration gate WITHOUT marking history finished");
         void (^continuation)(void) = (void (^)(void))blk;
         @try {
             continuation();
-            FZ(@"FckZck 1.32: registration-gate continuation executed");
+            FZ(@"FckZck 1.33: registration-gate continuation executed");
         } @catch (NSException *e) {
-            FZ(@"FckZck 1.32: registration-gate continuation exception=%@", e);
+            FZ(@"FckZck 1.33: registration-gate continuation exception=%@", e);
         }
         return;
     }
@@ -701,7 +702,7 @@ static void new_resumeBg(id self, SEL _cmd) {
 static void (*orig_hsSec)(id, SEL);
 static void new_hsSec(id self, SEL _cmd) {
     if (gSecCalled) {
-        FZ(@"FckZck 1.32: duplicate handleSecurityNotificationSetting suppressed");
+        FZ(@"FckZck 1.33: duplicate handleSecurityNotificationSetting suppressed");
         return;
     }
     FZ(@"FckZck: CompanionBootstrapLoading.handleSecurityNotificationSetting called");
@@ -717,39 +718,39 @@ static void new_hsSec(id self, SEL _cmd) {
 static void FZReleaseBootstrapUI(const char *why) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gInitialCalled && gSecCalled) {
-            FZ(@"FckZck 1.32: releaseUI(%s): bootstrap UI already released", why);
+            FZ(@"FckZck 1.33: releaseUI(%s): bootstrap UI already released", why);
             return;
         }
 
         id boot = gBootObj;
         if (!boot || !orig_hsInitial) {
             if (gBootstrapFinishTries++ < 15) {
-                FZ(@"FckZck 1.32: releaseUI(%s): bootstrap object unavailable; retry in 1 s (%d)",
+                FZ(@"FckZck 1.33: releaseUI(%s): bootstrap object unavailable; retry in 1 s (%d)",
                    why, gBootstrapFinishTries);
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
                                dispatch_get_main_queue(), ^{
                     FZReleaseBootstrapUI(why);
                 });
             } else {
-                FZ(@"FckZck 1.32: releaseUI(%s): gave up waiting for bootstrap object", why);
+                FZ(@"FckZck 1.33: releaseUI(%s): gave up waiting for bootstrap object", why);
             }
             return;
         }
 
         if (gBootstrapFinishRunning) return;
         gBootstrapFinishRunning = YES;
-        FZ(@"FckZck 1.32: releaseUI(%s): initialCalled=%d secCalled=%d realHistoryFinished=%d",
+        FZ(@"FckZck 1.33: releaseUI(%s): initialCalled=%d secCalled=%d realHistoryFinished=%d",
            why, gInitialCalled, gSecCalled,
            (gHistSvc && orig_isInit) ? orig_isInit(gHistSvc, sel_registerName("isInitialSyncFinished")) : -1);
 
         @try {
             if (!gInitialCalled) {
                 gInitialCalled = YES;
-                FZ(@"FckZck 1.32: releasing bootstrap handleInitialHistorySync (UI gate only)");
+                FZ(@"FckZck 1.33: releasing bootstrap handleInitialHistorySync (UI gate only)");
                 orig_hsInitial(boot, sel_registerName("handleInitialHistorySync"));
             }
         } @catch (NSException *e) {
-            FZ(@"FckZck 1.32: handleInitialHistorySync exception=%@", e);
+            FZ(@"FckZck 1.33: handleInitialHistorySync exception=%@", e);
         }
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
@@ -757,11 +758,11 @@ static void FZReleaseBootstrapUI(const char *why) {
             @try {
                 if (!gSecCalled && orig_hsSec) {
                     gSecCalled = YES;
-                    FZ(@"FckZck 1.32: releasing bootstrap handleSecurityNotificationSetting (UI gate only)");
+                    FZ(@"FckZck 1.33: releasing bootstrap handleSecurityNotificationSetting (UI gate only)");
                     orig_hsSec(boot, sel_registerName("handleSecurityNotificationSetting"));
                 }
             } @catch (NSException *e) {
-                FZ(@"FckZck 1.32: handleSecurityNotificationSetting exception=%@", e);
+                FZ(@"FckZck 1.33: handleSecurityNotificationSetting exception=%@", e);
             }
             gBootstrapFinishRunning = NO;
         });
@@ -772,7 +773,7 @@ static void (*orig_critBlock)(id, SEL, id);
 static void new_critBlock(id self, SEL _cmd, id arg) {
     // Strongly retain the bootstrap coordinator while pairing is in progress.
     gBootObj = self;
-    FZ(@"FckZck 1.32: criticalBlockCollection callback; bootstrap object captured");
+    FZ(@"FckZck 1.33: criticalBlockCollection callback; bootstrap object captured");
     orig_critBlock(self, _cmd, arg);
 }
 
@@ -785,7 +786,7 @@ static void new_logoutAuth(id self, SEL _cmd, long long reason, BOOL restart, id
         // Do not destroy an otherwise authenticated companion because the iOS 12 history
         // state machine failed to release its UI gate. Release only the bootstrap UI; keep
         // the real history completion bit untouched so background sync may continue.
-        FZ(@"FckZck 1.32: -> history_sync_timeout logout blocked; releasing bootstrap UI only");
+        FZ(@"FckZck 1.33: -> history_sync_timeout logout blocked; releasing bootstrap UI only");
         FZReleaseBootstrapUI("history_sync_timeout blocked");
         return;
     }
@@ -1021,11 +1022,11 @@ static BOOL FZInstallSignalHooks(void) {
 // -------------------------------------------------------------------------
 
 
-// ---- 1.32: Companion DeviceProps full-history request ----------------------
-// WhatsApp companion registration DeviceProps contains requireFullSync and a
-// HistorySyncConfig. Old iOS may be creating these with conservative/default values,
-// which fits the observed server behavior (INITIAL_BOOTSTRAP/STATUS/PUSH_NAME only,
-// never FULL/RECENT). Hook the generated protobuf setters/getters if present.
+// ---- 1.33: CompanionProps full-history request ------------------------------
+// Public protocol names this message DeviceProps, but this iOS build exposes it as
+// WAPBCompanionProps. 1.32 only searched for class names containing "DeviceProps",
+// so it found the nested HistorySyncConfig but never the parent object. 1.33 hooks
+// WAPBCompanionProps directly and also forces the values immediately after init.
 static void (*orig_setRequireFullSync)(id, SEL, BOOL) = NULL;
 static void (*orig_setHistorySyncConfig)(id, SEL, id) = NULL;
 static BOOL (*orig_requireFullSync)(id, SEL) = NULL;
@@ -1034,16 +1035,19 @@ static void (*orig_setFullSyncSizeMbLimit)(id, SEL, unsigned int) = NULL;
 static void (*orig_setStorageQuotaMb)(id, SEL, unsigned int) = NULL;
 static void (*orig_setRecentSyncDaysLimit)(id, SEL, unsigned int) = NULL;
 static void (*orig_setOnDemandReady)(id, SEL, BOOL) = NULL;
+static id (*orig_companionPropsInit)(id, SEL) = NULL;
+
+static void FZForceCompanionPropsObject(id obj, NSString *where);
 
 static void new_setRequireFullSync(id self, SEL _cmd, BOOL value) {
     BOOL out = gForceFullHistorySync ? YES : value;
-    FZ(@"FckZck 1.32: DeviceProps.setRequireFullSync input=%d -> %d class=%@", value, out, NSStringFromClass([self class]));
+    FZ(@"FckZck 1.33: CompanionProps.setRequireFullSync input=%d -> %d class=%@", value, out, NSStringFromClass([self class]));
     orig_setRequireFullSync(self, _cmd, out);
 }
 static BOOL new_requireFullSync(id self, SEL _cmd) {
     BOOL real = orig_requireFullSync ? orig_requireFullSync(self, _cmd) : NO;
     BOOL out = gForceFullHistorySync ? YES : real;
-    FZ(@"FckZck 1.32: DeviceProps.requireFullSync real=%d -> %d class=%@", real, out, NSStringFromClass([self class]));
+    FZ(@"FckZck 1.33: CompanionProps.requireFullSync real=%d -> %d class=%@", real, out, NSStringFromClass([self class]));
     return out;
 }
 
@@ -1051,52 +1055,103 @@ static void FZApplyHistorySyncConfigValues(id cfg) {
     if (!gForceFullHistorySync || !cfg) return;
     NSDictionary *values = @{
         @"fullSyncDaysLimit": @365,
-        @"fullSyncSizeMbLimit": @512,
-        @"storageQuotaMb": @1024,
+        @"fullSyncSizeMbLimit": @10240,
+        @"storageQuotaMb": @10240,
         @"recentSyncDaysLimit": @90,
         @"onDemandReady": @YES
     };
     for (NSString *key in values) {
         @try {
             [cfg setValue:values[key] forKey:key];
-            FZ(@"FckZck 1.32: HistorySyncConfig KVC %@=%@ class=%@", key, values[key], NSStringFromClass([cfg class]));
+            FZ(@"FckZck 1.33: HistorySyncConfig KVC %@=%@ class=%@", key, values[key], NSStringFromClass([cfg class]));
         } @catch (NSException *e) {
             // Older schema versions simply don't expose every newer field.
         }
     }
 }
 
-static void new_setHistorySyncConfig(id self, SEL _cmd, id cfg) {
-    if (gForceFullHistorySync) {
-        @try { [self setValue:@YES forKey:@"requireFullSync"]; } @catch (NSException *e) {}
+static void FZForceCompanionPropsObject(id obj, NSString *where) {
+    if (!gForceFullHistorySync || !obj) return;
+
+    // Force the boolean through the generated setter so the protobuf presence bit is set.
+    @try {
+        [obj setValue:@YES forKey:@"requireFullSync"];
+    } @catch (NSException *e) {
+        FZ(@"FckZck 1.33: %@ could not set requireFullSync on %@: %@", where, NSStringFromClass([obj class]), e.reason);
+    }
+
+    id cfg = nil;
+    @try { cfg = [obj valueForKey:@"historySyncConfig"]; } @catch (NSException *e) {}
+    if (!cfg) {
+        Class cc = objc_getClass("WAPBCompanionProps_HistorySyncConfig");
+        if (cc) {
+            @try { cfg = [[cc alloc] init]; } @catch (NSException *e) { cfg = nil; }
+            if (cfg) {
+                FZApplyHistorySyncConfigValues(cfg);
+                @try {
+                    [obj setValue:cfg forKey:@"historySyncConfig"];
+                    FZ(@"FckZck 1.33: %@ created+attached HistorySyncConfig class=%@", where, NSStringFromClass([cfg class]));
+                } @catch (NSException *e) {
+                    FZ(@"FckZck 1.33: %@ could not attach HistorySyncConfig: %@", where, e.reason);
+                }
+            }
+        }
+    } else {
         FZApplyHistorySyncConfigValues(cfg);
     }
-    FZ(@"FckZck 1.32: DeviceProps.setHistorySyncConfig class=%@ configClass=%@", NSStringFromClass([self class]), cfg ? NSStringFromClass([cfg class]) : @"nil");
+
+    // Some protobuf runtimes expose an explicit has-bit setter. Set it when present.
+    SEL hasSel = sel_registerName("setHasRequireFullSync:");
+    if ([obj respondsToSelector:hasSel]) {
+        @try {
+            IMP imp = [obj methodForSelector:hasSel];
+            if (imp) ((void (*)(id, SEL, BOOL))imp)(obj, hasSel, YES);
+        } @catch (NSException *e) {}
+    }
+
+    id req = nil;
+    id gotCfg = nil;
+    @try { req = [obj valueForKey:@"requireFullSync"]; } @catch (NSException *e) {}
+    @try { gotCfg = [obj valueForKey:@"historySyncConfig"]; } @catch (NSException *e) {}
+    FZ(@"FckZck 1.33: %@ CompanionProps forced class=%@ requireFullSync=%@ historySyncConfig=%@",
+       where, NSStringFromClass([obj class]), req ?: @"?", gotCfg ? NSStringFromClass([gotCfg class]) : @"nil");
+}
+
+static id new_companionPropsInit(id self, SEL _cmd) {
+    id obj = orig_companionPropsInit ? orig_companionPropsInit(self, _cmd) : self;
+    FZForceCompanionPropsObject(obj, @"init");
+    return obj;
+}
+
+static void new_setHistorySyncConfig(id self, SEL _cmd, id cfg) {
+    if (gForceFullHistorySync) FZApplyHistorySyncConfigValues(cfg);
+    FZ(@"FckZck 1.33: CompanionProps.setHistorySyncConfig class=%@ configClass=%@", NSStringFromClass([self class]), cfg ? NSStringFromClass([cfg class]) : @"nil");
     orig_setHistorySyncConfig(self, _cmd, cfg);
+    FZForceCompanionPropsObject(self, @"setHistorySyncConfig");
 }
 static void new_setFullSyncDaysLimit(id self, SEL _cmd, unsigned int value) {
     unsigned int out = gForceFullHistorySync ? MAX(value, 365U) : value;
-    FZ(@"FckZck 1.32: HistorySyncConfig.fullSyncDaysLimit %u -> %u", value, out);
+    FZ(@"FckZck 1.33: HistorySyncConfig.fullSyncDaysLimit %u -> %u", value, out);
     orig_setFullSyncDaysLimit(self, _cmd, out);
 }
 static void new_setFullSyncSizeMbLimit(id self, SEL _cmd, unsigned int value) {
-    unsigned int out = gForceFullHistorySync ? MAX(value, 512U) : value;
-    FZ(@"FckZck 1.32: HistorySyncConfig.fullSyncSizeMbLimit %u -> %u", value, out);
+    unsigned int out = gForceFullHistorySync ? MAX(value, 10240U) : value;
+    FZ(@"FckZck 1.33: HistorySyncConfig.fullSyncSizeMbLimit %u -> %u", value, out);
     orig_setFullSyncSizeMbLimit(self, _cmd, out);
 }
 static void new_setStorageQuotaMb(id self, SEL _cmd, unsigned int value) {
-    unsigned int out = gForceFullHistorySync ? MAX(value, 1024U) : value;
-    FZ(@"FckZck 1.32: HistorySyncConfig.storageQuotaMb %u -> %u", value, out);
+    unsigned int out = gForceFullHistorySync ? MAX(value, 10240U) : value;
+    FZ(@"FckZck 1.33: HistorySyncConfig.storageQuotaMb %u -> %u", value, out);
     orig_setStorageQuotaMb(self, _cmd, out);
 }
 static void new_setRecentSyncDaysLimit(id self, SEL _cmd, unsigned int value) {
     unsigned int out = gForceFullHistorySync ? MAX(value, 90U) : value;
-    FZ(@"FckZck 1.32: HistorySyncConfig.recentSyncDaysLimit %u -> %u", value, out);
+    FZ(@"FckZck 1.33: HistorySyncConfig.recentSyncDaysLimit %u -> %u", value, out);
     orig_setRecentSyncDaysLimit(self, _cmd, out);
 }
 static void new_setOnDemandReady(id self, SEL _cmd, BOOL value) {
     BOOL out = gForceFullHistorySync ? YES : value;
-    FZ(@"FckZck 1.32: HistorySyncConfig.onDemandReady %d -> %d", value, out);
+    FZ(@"FckZck 1.33: HistorySyncConfig.onDemandReady %d -> %d", value, out);
     orig_setOnDemandReady(self, _cmd, out);
 }
 
@@ -1118,10 +1173,10 @@ static BOOL FZHookU32HistorySetter(Class c, NSString *name, const char *selName,
     if (*orig) return NO;
     Method m = class_getInstanceMethod(c, sel_registerName(selName));
     const char *enc = m ? method_getTypeEncoding(m) : NULL;
-    if (m) FZ(@"FckZck 1.32: HistorySyncConfig candidate %@ %s type=%s", name, selName, enc ?: "?");
+    if (m) FZ(@"FckZck 1.33: HistorySyncConfig candidate %@ %s type=%s", name, selName, enc ?: "?");
     if (!m || !FZMethodHasArgType(m, "I")) return NO;
     MSHookMessageEx(c, sel_registerName(selName), repl, orig);
-    FZ(@"FckZck 1.32: hooked %@ %s", name, selName);
+    FZ(@"FckZck 1.33: hooked %@ %s", name, selName);
     return YES;
 }
 
@@ -1155,7 +1210,7 @@ static BOOL FZMethodHasObjectArg(Method m) {
 
 static BOOL FZInstallFullHistoryPropsHooks(void) {
     if (!gForceFullHistorySync) {
-        FZ(@"FckZck 1.32: full-history DeviceProps override disabled");
+        FZ(@"FckZck 1.33: full-history CompanionProps override disabled");
         return YES;
     }
     BOOL hookedAny = NO;
@@ -1165,36 +1220,48 @@ static BOOL FZInstallFullHistoryPropsHooks(void) {
         Class c = classes[i];
         NSString *name = NSStringFromClass(c);
         if (!name.length) continue;
-        BOOL deviceCandidate = ([name rangeOfString:@"DeviceProps" options:NSCaseInsensitiveSearch].location != NSNotFound);
         BOOL histCandidate = ([name rangeOfString:@"HistorySyncConfig" options:NSCaseInsensitiveSearch].location != NSNotFound);
-        if (!deviceCandidate && !histCandidate) continue;
+        BOOL deviceCandidate = ([name rangeOfString:@"DeviceProps" options:NSCaseInsensitiveSearch].location != NSNotFound);
+        BOOL companionPropsCandidate = [name isEqualToString:@"WAPBCompanionProps"] ||
+            ([name rangeOfString:@"CompanionProps" options:NSCaseInsensitiveSearch].location != NSNotFound && !histCandidate && [name rangeOfString:@"_"].location == NSNotFound);
+        BOOL propsCandidate = deviceCandidate || companionPropsCandidate;
+        if (!propsCandidate && !histCandidate) continue;
 
-        if (deviceCandidate && !orig_setRequireFullSync) {
+        if (propsCandidate && !orig_companionPropsInit) {
+            Method m = class_getInstanceMethod(c, sel_registerName("init"));
+            if (m && method_getNumberOfArguments(m) == 2) {
+                MSHookMessageEx(c, sel_registerName("init"), (IMP)new_companionPropsInit, (IMP *)&orig_companionPropsInit);
+                hookedAny = YES;
+                FZ(@"FckZck 1.33: hooked %@ init (CompanionProps force point)", name);
+            }
+        }
+
+        if (propsCandidate && !orig_setRequireFullSync) {
             Method m = class_getInstanceMethod(c, sel_registerName("setRequireFullSync:"));
             const char *enc = m ? method_getTypeEncoding(m) : NULL;
-            if (m) FZ(@"FckZck 1.32: DeviceProps candidate %@ setRequireFullSync type=%s", name, enc ?: "?");
+            if (m) FZ(@"FckZck 1.33: CompanionProps candidate %@ setRequireFullSync type=%s", name, enc ?: "?");
             if (m && FZMethodHasBoolArg(m)) {
                 MSHookMessageEx(c, sel_registerName("setRequireFullSync:"), (IMP)new_setRequireFullSync, (IMP *)&orig_setRequireFullSync);
                 hookedAny = YES;
-                FZ(@"FckZck 1.32: hooked %@ setRequireFullSync:", name);
+                FZ(@"FckZck 1.33: hooked %@ setRequireFullSync:", name);
             }
         }
-        if (deviceCandidate && !orig_setHistorySyncConfig) {
+        if (propsCandidate && !orig_setHistorySyncConfig) {
             Method m = class_getInstanceMethod(c, sel_registerName("setHistorySyncConfig:"));
             const char *enc = m ? method_getTypeEncoding(m) : NULL;
-            if (m) FZ(@"FckZck 1.32: DeviceProps candidate %@ setHistorySyncConfig type=%s", name, enc ?: "?");
+            if (m) FZ(@"FckZck 1.33: CompanionProps candidate %@ setHistorySyncConfig type=%s", name, enc ?: "?");
             if (m && FZMethodHasObjectArg(m)) {
                 MSHookMessageEx(c, sel_registerName("setHistorySyncConfig:"), (IMP)new_setHistorySyncConfig, (IMP *)&orig_setHistorySyncConfig);
                 hookedAny = YES;
-                FZ(@"FckZck 1.32: hooked %@ setHistorySyncConfig:", name);
+                FZ(@"FckZck 1.33: hooked %@ setHistorySyncConfig:", name);
             }
         }
-        if (deviceCandidate && !orig_requireFullSync) {
+        if (propsCandidate && !orig_requireFullSync) {
             Method m = class_getInstanceMethod(c, sel_registerName("requireFullSync"));
             if (m && FZMethodReturnsBool(m)) {
                 MSHookMessageEx(c, sel_registerName("requireFullSync"), (IMP)new_requireFullSync, (IMP *)&orig_requireFullSync);
                 hookedAny = YES;
-                FZ(@"FckZck 1.32: hooked %@ requireFullSync", name);
+                FZ(@"FckZck 1.33: hooked %@ requireFullSync", name);
             }
         }
         if (histCandidate) {
@@ -1205,17 +1272,17 @@ static BOOL FZInstallFullHistoryPropsHooks(void) {
             if (!orig_setOnDemandReady) {
                 Method m = class_getInstanceMethod(c, sel_registerName("setOnDemandReady:"));
                 const char *enc = m ? method_getTypeEncoding(m) : NULL;
-                if (m) FZ(@"FckZck 1.32: HistorySyncConfig candidate %@ setOnDemandReady type=%s", name, enc ?: "?");
+                if (m) FZ(@"FckZck 1.33: HistorySyncConfig candidate %@ setOnDemandReady type=%s", name, enc ?: "?");
                 if (m && FZMethodHasBoolArg(m)) {
                     MSHookMessageEx(c, sel_registerName("setOnDemandReady:"), (IMP)new_setOnDemandReady, (IMP *)&orig_setOnDemandReady);
                     hookedAny = YES;
-                    FZ(@"FckZck 1.32: hooked %@ setOnDemandReady:", name);
+                    FZ(@"FckZck 1.33: hooked %@ setOnDemandReady:", name);
                 }
             }
         }
     }
     free(classes);
-    if (!hookedAny) FZ(@"FckZck 1.32: DeviceProps/HistorySyncConfig setters not found yet");
+    if (!hookedAny) FZ(@"FckZck 1.33: CompanionProps/HistorySyncConfig hooks not found yet");
     return hookedAny;
 }
 // -------------------------------------------------------------------------
@@ -1247,7 +1314,7 @@ static void FZRememberHistoryDirectPath(NSString *dp) {
     @synchronized (gHistoryDirectPaths) {
         [gHistoryDirectPaths addObject:path];
     }
-    FZ(@"FckZck 1.32: remembered HistorySync directPath=%@", path);
+    FZ(@"FckZck 1.33: remembered HistorySync directPath=%@", path);
 }
 
 static BOOL FZIsHistoryEncURL(NSURL *url) {
@@ -1262,7 +1329,7 @@ static BOOL FZIsHistoryEncURL(NSURL *url) {
 static NSURLRequest *FZFreshHistoryRequest(NSURLRequest *req, NSString *where) {
     if (!gForceFreshHistoryDownload || !req || !FZIsHistoryEncURL(req.URL)) return req;
     NSString *range = [req valueForHTTPHeaderField:@"Range"];
-    FZ(@"FckZck 1.32: %@ exact-history .enc request Range=%@ url=%@", where, range ?: @"(none)", req.URL.host);
+    FZ(@"FckZck 1.33: %@ exact-history .enc request Range=%@ url=%@", where, range ?: @"(none)", req.URL.host);
     NSMutableURLRequest *m = [req mutableCopy];
     [m setValue:nil forHTTPHeaderField:@"Range"];
     [m setCachePolicy:NSURLRequestReloadIgnoringLocalCacheData];
@@ -1272,7 +1339,7 @@ static NSURLRequest *FZFreshHistoryRequest(NSURLRequest *req, NSString *where) {
 %hook NSMutableURLRequest
 - (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
     if (gForceFreshHistoryDownload && [field caseInsensitiveCompare:@"Range"] == NSOrderedSame && FZIsHistoryEncURL(self.URL)) {
-        FZ(@"FckZck 1.32: suppressing exact-history Range header %@", value);
+        FZ(@"FckZck 1.33: suppressing exact-history Range header %@", value);
         %orig(nil, field);
         return;
     }
@@ -1280,7 +1347,7 @@ static NSURLRequest *FZFreshHistoryRequest(NSURLRequest *req, NSString *where) {
 }
 - (void)addValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
     if (gForceFreshHistoryDownload && [field caseInsensitiveCompare:@"Range"] == NSOrderedSame && FZIsHistoryEncURL(self.URL)) {
-        FZ(@"FckZck 1.32: suppressing added exact-history Range header %@", value);
+        FZ(@"FckZck 1.33: suppressing added exact-history Range header %@", value);
         return;
     }
     %orig;
@@ -1370,7 +1437,7 @@ static CFTypeRef new_CFBundleGetValue(CFBundleRef b, CFStringRef key) {
         FZ(@"FckZck: bundle version spoof=%d -> %@ (real short=%@ build=%@)", gSpoofBundle, gBundleVer, real[@"CFBundleShortVersionString"], real[@"CFBundleVersion"]);
         MSHookFunction((void *)CFBundleGetValueForInfoDictionaryKey, (void *)new_CFBundleGetValue, (void **)&orig_CFBundleGetValue);
     }
-    FZ(@"FckZck 1.32 full-history-request build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    FZ(@"FckZck 1.33 companionprops-fullsync build loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
     if (!FZInstallUserAgentHooks()) {
         FZ(@"FckZck: WAPBClientPayload_UserAgent not found yet, retrying in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
