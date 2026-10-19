@@ -107,13 +107,13 @@ This is an unofficial project. It is not affiliated with, endorsed by, or connec
 
 ## iOS 15 spoof (1.26.2)
 
-WhatsApp now declares iOS 15.8.3 (build 19H386) to the server in `ClientPayload.UserAgent`.
+Optional: WhatsApp can declare another iOS version to the server in `ClientPayload.UserAgent`. **Off by default since 1.26.4** (iPhone 6 + fake iOS 15 made the server drop the connection).
 Optional keys in `/var/mobile/Library/Preferences/com.ifilipis.fckzck.plist`:
 
 | key | type | default | what it does |
 |---|---|---|---|
-| `osVersion` | string | `15.8.3` | OS version sent to the server. Empty string = send the real one |
-| `osBuildNumber` | string | `19H386` | OS build sent to the server. Empty string = real one |
+| `osVersion` | string | (off) | OS version sent to the server, e.g. `15.8.3`. Empty/missing = send the real one |
+| `osBuildNumber` | string | (off) | OS build sent to the server, e.g. `19H386`. Empty/missing = real one |
 | `spoofLocalOS` | bool | `false` | also fake `UIDevice` / `NSProcessInfo` inside the app (can crash if WhatsApp starts using iOS 15-only APIs) |
 
 

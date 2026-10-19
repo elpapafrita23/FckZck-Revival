@@ -163,10 +163,12 @@ static void FZLoadConfig(void) {
     id fs = cfg[@"forceSyncState"];
     if ([fs isKindOfClass:[NSNumber class]]) { gForceSyncState = fs; FZ(@"FckZck: forceSyncState=%@", fs); } else { FZ(@"FckZck: forceSyncState default=%@", gForceSyncState); }
     // 1.26.2: declare iOS 15 to the server (ClientPayload.UserAgent) and, optionally, to the app.
-    // plist keys: osVersion (string, "" = off, default 15.8.3), osBuildNumber (default 19H386),
+    // plist keys: osVersion (string, default OFF, e.g. "15.8.3"), osBuildNumber (e.g. "19H386"),
     //             spoofLocalOS (bool, default NO) = also fake UIDevice / NSProcessInfo inside the app.
-    gOsVersion = DEFAULT_OS_VERSION;
-    gOsBuild = DEFAULT_OS_BUILD;
+    // 1.26.4: OFF by default. A fake iOS 15 on an iPhone 6 (max iOS 12) is an impossible device/OS
+    // pair; with it active the connection was dropped right after the handshake. Opt in via plist.
+    gOsVersion = nil;
+    gOsBuild = nil;
     id ov = cfg[@"osVersion"];
     if ([ov isKindOfClass:[NSString class]]) gOsVersion = ([(NSString *)ov length] ? ov : nil);
     id ob = cfg[@"osBuildNumber"];
