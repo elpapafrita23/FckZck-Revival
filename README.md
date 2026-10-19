@@ -125,3 +125,8 @@ On WhatsApp builds without `SharedModules.framework` (e.g. 2.25.1.83) the expiry
 ## 1.26.5 (diagnostics)
 
 `fckzck.log` now contains every WhatsApp log line (plist key `logAll` = false restores the filtered log) and every failed keychain call (OSStatus, service, access group). Used to find out why the server connection drops right after "Failed to save server static key".
+
+
+## 1.26.6 (diagnostics)
+
+Logs app-group container access (`appGroupContainer ... -> NIL` means no access), `NSUserDefaults` suites, failed `NSData` file writes, the first keychain calls (success or not) and dumps connection/data-store classes to `Documents/fckzck-conn-classes.txt`.

@@ -1008,6 +1008,60 @@ static CFTypeRef new_CFBundleGetValue(CFBundleRef b, CFStringRef key) {
 %end
 // -------------------------------------------------------------------------
 
+// ---- 1.26.6: storage diagnostics (why does "Failed to save server static key" happen?) ----
+%hook NSFileManager
+- (NSURL *)containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
+    NSURL *r = %orig;
+    static NSMutableSet *seen;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+    @synchronized (seen) {
+        NSString *k = [NSString stringWithFormat:@"%@|%d", groupIdentifier, r ? 1 : 0];
+        if (![seen containsObject:k]) {
+            [seen addObject:k];
+            FZ(@"FckZck: appGroupContainer %@ -> %@", groupIdentifier, r ? r.path : @"NIL (no access to this app group!)");
+        }
+    }
+    return r;
+}
+%end
+
+%hook NSUserDefaults
+- (id)initWithSuiteName:(NSString *)suitename {
+    id r = %orig;
+    static NSMutableSet *seen;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+    @synchronized (seen) {
+        NSString *k = [NSString stringWithFormat:@"%@|%d", suitename, r ? 1 : 0];
+        if (![seen containsObject:k]) {
+            [seen addObject:k];
+            FZ(@"FckZck: NSUserDefaults suite %@ -> %@", suitename, r ? @"ok" : @"NIL");
+        }
+    }
+    return r;
+}
+%end
+
+%hook NSData
+- (BOOL)writeToFile:(NSString *)path options:(NSDataWritingOptions)mask error:(NSError **)errorPtr {
+    BOOL r = %orig;
+    if (!r) FZ(@"FckZck: NSData writeToFile FAILED path=%@ error=%@", path, errorPtr ? *errorPtr : nil);
+    return r;
+}
+- (BOOL)writeToFile:(NSString *)path atomically:(BOOL)useAuxiliaryFile {
+    BOOL r = %orig;
+    if (!r) FZ(@"FckZck: NSData writeToFile:atomically FAILED path=%@", path);
+    return r;
+}
+- (BOOL)writeToURL:(NSURL *)url options:(NSDataWritingOptions)mask error:(NSError **)errorPtr {
+    BOOL r = %orig;
+    if (!r) FZ(@"FckZck: NSData writeToURL FAILED url=%@ error=%@", url, errorPtr ? *errorPtr : nil);
+    return r;
+}
+%end
+// -------------------------------------------------------------------------
+
 %hook NSBundle
 
 - (id)objectForInfoDictionaryKey:(NSString *)key {
@@ -1049,18 +1103,19 @@ static void FZKeychainLog(const char *fn, CFDictionaryRef q, OSStatus st) {
     id svc = d[(__bridge id)kSecAttrService];
     id grp = d[(__bridge id)kSecAttrAccessGroup];
     id acc = d[(__bridge id)kSecAttrAccount];
-    FZ(@"FckZck: Keychain %s failed status=%d service=%@ group=%@ account=%@", fn, (int)st, svc, grp, FZMask([NSString stringWithFormat:@"%@", acc]));
+    FZ(@"FckZck: Keychain %s status=%d service=%@ group=%@ account=%@", fn, (int)st, svc, grp, FZMask([NSString stringWithFormat:@"%@", acc]));
 }
+static int gKcLogged = 0;
 static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *);
 static OSStatus new_SecItemAdd(CFDictionaryRef a, CFTypeRef *r) {
     OSStatus s = orig_SecItemAdd(a, r);
-    if (s != errSecSuccess) FZKeychainLog("SecItemAdd", a, s);
+    if (s != errSecSuccess || gKcLogged++ < 40) FZKeychainLog("SecItemAdd", a, s);
     return s;
 }
 static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef, CFDictionaryRef);
 static OSStatus new_SecItemUpdate(CFDictionaryRef q, CFDictionaryRef u) {
     OSStatus s = orig_SecItemUpdate(q, u);
-    if (s != errSecSuccess) FZKeychainLog("SecItemUpdate", q, s);
+    if (s != errSecSuccess || gKcLogged++ < 40) FZKeychainLog("SecItemUpdate", q, s);
     return s;
 }
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
@@ -1184,6 +1239,9 @@ static void FZHookExpiryMethods(void) {
     // -> <app Documents>/fckzck-history-classes.txt (written ~20 s after launch)
     FZDumpClassesMatching(@[@"HistorySync", @"InitialSync", @"InlinePayload", @"WAHistory", @"Bootstrap", @"CompanionSync"],
                           @"fckzck-history-classes.txt");
+    // 1.26.6: connection / data-store layer (Documents/fckzck-conn-classes.txt, ~20 s after launch)
+    FZDumpClassesMatching(@[@"DataStore", @"StaticKey", @"ServerStatic", @"Noise", @"Handshake", @"WCC", @"HappyEyeballs", @"ConnectionStore"],
+                          @"fckzck-conn-classes.txt");
     if (!FZInstallSignalHooks()) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!FZInstallSignalHooks()) FZ(@"FckZck: signal classes still not found");
@@ -1224,7 +1282,7 @@ static void FZHookExpiryMethods(void) {
 -(NSString*)formatLogText:(NSString*)ar1 withLevel:(int)ar2 {
 	NSString *result = %orig;
 	if (gLogAll) {
-		if (result && [result rangeOfString:@"string-in-wrong-bundle"].location == NSNotFound) FZ(@"WALog: %@", result);
+		if (result && [result rangeOfString:@"string-in-wrong-bundle"].location == NSNotFound && [result rangeOfString:@"abprop/saved"].location == NSNotFound) FZ(@"WALog: %@", result);
 		return result;
 	}
 	static NSArray *keys;
