@@ -1,6 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #include <substrate.h>
+#include <mach-o/dyld.h>
+#include <string.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
 
@@ -1033,6 +1035,90 @@ static CFTypeRef new_CFBundleGetValue(CFBundleRef b, CFStringRef key) {
 %end
 // -------------------------------------------------------------------------
 
+// ---- 1.26.3: expiry / deprecation hooks when SharedModules.framework does not exist ----
+// WhatsApp 2.25.x has no Frameworks/SharedModules.framework, so the symbol hooks (WAAppExpirationDate,
+// WAIsPlatformDeprecated, WABuildVersion...) were never installed and the app showed the
+// "build expired / not compatible with older iOS" screen. Here we look for those symbols in EVERY image
+// inside WhatsApp.app, and additionally hook ObjC "is build expired / platform deprecated" getters.
+static BOOL fz_retNO(id self, SEL _cmd) {
+    FZ(@"FckZck: %@ %s -> NO", NSStringFromClass([self class]), sel_getName(_cmd));
+    return NO;
+}
+
+static void FZHookSymbolsInAppImages(void) {
+    typedef struct { const char *name; void *rep; void **orig; BOOL found; } FZSym;
+    FZSym syms[] = {
+        {"_WAAppExpirationDate", (void *)&_new_WAAppExpirationDate, (void **)&_orig_WAAppExpirationDate, NO},
+        {"_WABuildDate", (void *)&_new_WABuildDate, (void **)&_orig_WABuildDate, NO},
+        {"_WABuildVersion", (void *)&_new_WABuildVersion, (void **)&_orig_WABuildVersion, NO},
+        {"_WABuildHash", (void *)&_new_WABuildHash, (void **)&_orig_WABuildHash, NO},
+        {"_WADeprecatedPlatformCutOffDate", (void *)&_new_WADeprecatedPlatformCutOffDate, (void **)&_orig_WADeprecatedPlatformCutOffDate, NO},
+        {"_WAIsPlatformDeprecated", (void *)&_new_WAIsPlatformDeprecated, (void **)&_orig_WAIsPlatformDeprecated, NO},
+        {"_WAShouldShowPlatformDeprecationNags", (void *)&_new_WAShouldShowPlatformDeprecationNags, (void **)&_orig_WAShouldShowPlatformDeprecationNags, NO},
+    };
+    const size_t nsyms = sizeof(syms) / sizeof(syms[0]);
+    const char *appDir = [[[NSBundle mainBundle] bundlePath] UTF8String];
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (!path || !appDir || !strstr(path, appDir)) continue;
+        MSImageRef img = MSGetImageByName(path);
+        if (!img) continue;
+        for (size_t k = 0; k < nsyms; k++) {
+            if (syms[k].found) continue;
+            void *sym = MSFindSymbol(img, syms[k].name);
+            if (sym) {
+                MSHookFunction(sym, syms[k].rep, syms[k].orig);
+                syms[k].found = YES;
+                FZ(@"FckZck 1.26.3: hooked %s in %s", syms[k].name, path);
+            }
+        }
+    }
+    for (size_t k = 0; k < nsyms; k++)
+        if (!syms[k].found) FZ(@"FckZck 1.26.3: symbol %s not found in any WhatsApp image", syms[k].name);
+}
+
+static void FZHookExpiryMethods(void) {
+    const char *appDir = [[[NSBundle mainBundle] bundlePath] UTF8String];
+    uint32_t n = _dyld_image_count();
+    int hooked = 0, seen = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (!path || !appDir || !strstr(path, appDir)) continue;
+        unsigned int cc = 0;
+        const char **names = objc_copyClassNamesForImage(path, &cc);
+        if (!names) continue;
+        for (unsigned int j = 0; j < cc; j++) {
+            Class c = objc_getClass(names[j]);
+            if (!c) continue;
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList(c, &mc);
+            for (unsigned int m = 0; m < mc; m++) {
+                const char *sn = sel_getName(method_getName(ms[m]));
+                const char *enc = method_getTypeEncoding(ms[m]);
+                if (!sn || !enc) continue;
+                BOOL interesting = strstr(sn, "xpire") || strstr(sn, "eprecat");
+                if (!interesting) continue;
+                BOOL isBoolGetter = (strcmp(enc, "B16@0:8") == 0);
+                BOOL target = isBoolGetter && (strstr(sn, "BuildExpired") || strstr(sn, "ExpiredBuild") ||
+                              strstr(sn, "PlatformDeprecat") || strstr(sn, "OSDeprecat"));
+                if (target && !(strcmp(names[j], "WARootViewController") == 0 && strcmp(sn, "isBuildExpired") == 0)) {
+                    MSHookMessageEx(c, method_getName(ms[m]), (IMP)fz_retNO, NULL);
+                    hooked++;
+                    FZ(@"FckZck 1.26.3: hooked %s %s (%s)", names[j], sn, enc);
+                } else if (seen < 80) {
+                    seen++;
+                    FZ(@"FckZck 1.26.3: candidate (not hooked) %s %s (%s)", names[j], sn, enc);
+                }
+            }
+            free(ms);
+        }
+        free(names);
+    }
+    FZ(@"FckZck 1.26.3: ObjC expiry/deprecation getters hooked: %d", hooked);
+}
+// -------------------------------------------------------------------------
+
 %ctor {
     FZLoadConfig();
     {
@@ -1076,6 +1162,8 @@ static CFTypeRef new_CFBundleGetValue(CFBundleRef b, CFStringRef key) {
 
     if (!image) {
         FZ(@"FckZck: failed to load image at path: %@", frameworkPath);
+        FZHookSymbolsInAppImages();
+        FZHookExpiryMethods();
         return;
     }
 
@@ -1131,6 +1219,7 @@ static CFTypeRef new_CFBundleGetValue(CFBundleRef b, CFStringRef key) {
 %hook WARootViewController
 
 -(bool)isBuildExpired {
+    FZ(@"FckZck: WARootViewController isBuildExpired -> NO");
     return false;
 }
 

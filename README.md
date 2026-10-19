@@ -115,3 +115,8 @@ Optional keys in `/var/mobile/Library/Preferences/com.ifilipis.fckzck.plist`:
 | `osVersion` | string | `15.8.3` | OS version sent to the server. Empty string = send the real one |
 | `osBuildNumber` | string | `19H386` | OS build sent to the server. Empty string = real one |
 | `spoofLocalOS` | bool | `false` | also fake `UIDevice` / `NSProcessInfo` inside the app (can crash if WhatsApp starts using iOS 15-only APIs) |
+
+
+## 1.26.3
+
+On WhatsApp builds without `SharedModules.framework` (e.g. 2.25.1.83) the expiry/deprecation symbols are now searched in every image inside WhatsApp.app, and ObjC getters like `isBuildExpired` / `isPlatformDeprecated` are hooked to return NO. Candidates that were found but not hooked are written to `fckzck.log`.
