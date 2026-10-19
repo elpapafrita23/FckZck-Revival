@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #include <substrate.h>
 #include <mach-o/dyld.h>
+#include <Security/Security.h>
 #include <string.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
@@ -58,6 +59,7 @@ static NSString *gOsVersion = nil;
 static NSString *gOsBuild = nil;
 #define DEFAULT_OS_VERSION @"15.8.3"
 #define DEFAULT_OS_BUILD   @"19H386"
+static BOOL gLogAll = YES;       // 1.26.5: log EVERY WhatsApp log line (plist key logAll = false to go back to the filtered log)
 static BOOL gSpoofLocalOS = NO;   // also fake the OS version seen by the app itself (UIDevice/NSProcessInfo)
 
 // Parses gOsVersion ("15.8.3") into major/minor/patch.
@@ -173,6 +175,8 @@ static void FZLoadConfig(void) {
     if ([ov isKindOfClass:[NSString class]]) gOsVersion = ([(NSString *)ov length] ? ov : nil);
     id ob = cfg[@"osBuildNumber"];
     if ([ob isKindOfClass:[NSString class]]) gOsBuild = ([(NSString *)ob length] ? ob : nil);
+    id la = cfg[@"logAll"];
+    if ([la respondsToSelector:@selector(boolValue)]) gLogAll = [la boolValue];
     id sl = cfg[@"spoofLocalOS"];
     if ([sl respondsToSelector:@selector(boolValue)]) gSpoofLocalOS = [sl boolValue];
     FZ(@"FckZck 1.26.2: osVersion=%@ osBuildNumber=%@ spoofLocalOS=%d", gOsVersion ? gOsVersion : @"(off)", gOsBuild ? gOsBuild : @"(off)", gSpoofLocalOS);
@@ -1037,6 +1041,42 @@ static CFTypeRef new_CFBundleGetValue(CFBundleRef b, CFStringRef key) {
 %end
 // -------------------------------------------------------------------------
 
+// ---- 1.26.5: keychain failure diagnostics -----------------------------------
+// The log shows "Failed to save server static key" right before the server connection drops.
+// These hooks only LOG failed keychain calls (OSStatus + service/group/account, never the values).
+static void FZKeychainLog(const char *fn, CFDictionaryRef q, OSStatus st) {
+    NSDictionary *d = (__bridge NSDictionary *)q;
+    id svc = d[(__bridge id)kSecAttrService];
+    id grp = d[(__bridge id)kSecAttrAccessGroup];
+    id acc = d[(__bridge id)kSecAttrAccount];
+    FZ(@"FckZck: Keychain %s failed status=%d service=%@ group=%@ account=%@", fn, (int)st, svc, grp, FZMask([NSString stringWithFormat:@"%@", acc]));
+}
+static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *);
+static OSStatus new_SecItemAdd(CFDictionaryRef a, CFTypeRef *r) {
+    OSStatus s = orig_SecItemAdd(a, r);
+    if (s != errSecSuccess) FZKeychainLog("SecItemAdd", a, s);
+    return s;
+}
+static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef, CFDictionaryRef);
+static OSStatus new_SecItemUpdate(CFDictionaryRef q, CFDictionaryRef u) {
+    OSStatus s = orig_SecItemUpdate(q, u);
+    if (s != errSecSuccess) FZKeychainLog("SecItemUpdate", q, s);
+    return s;
+}
+static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
+static OSStatus new_SecItemCopyMatching(CFDictionaryRef q, CFTypeRef *r) {
+    OSStatus s = orig_SecItemCopyMatching(q, r);
+    if (s != errSecSuccess && s != errSecItemNotFound) FZKeychainLog("SecItemCopyMatching", q, s);
+    return s;
+}
+static void FZInstallKeychainHooks(void) {
+    MSHookFunction((void *)SecItemAdd, (void *)new_SecItemAdd, (void **)&orig_SecItemAdd);
+    MSHookFunction((void *)SecItemUpdate, (void *)new_SecItemUpdate, (void **)&orig_SecItemUpdate);
+    MSHookFunction((void *)SecItemCopyMatching, (void *)new_SecItemCopyMatching, (void **)&orig_SecItemCopyMatching);
+    FZ(@"FckZck 1.26.5: keychain failure logging installed");
+}
+// -------------------------------------------------------------------------
+
 // ---- 1.26.3: expiry / deprecation hooks when SharedModules.framework does not exist ----
 // WhatsApp 2.25.x has no Frameworks/SharedModules.framework, so the symbol hooks (WAAppExpirationDate,
 // WAIsPlatformDeprecated, WABuildVersion...) were never installed and the app showed the
@@ -1123,6 +1163,7 @@ static void FZHookExpiryMethods(void) {
 
 %ctor {
     FZLoadConfig();
+    FZInstallKeychainHooks();
     {
         NSDictionary *bcfg = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/com.ifilipis.fckzck.plist"];
         id sp = bcfg[@"spoofBundleVersion"];
@@ -1182,6 +1223,10 @@ static void FZHookExpiryMethods(void) {
 
 -(NSString*)formatLogText:(NSString*)ar1 withLevel:(int)ar2 {
 	NSString *result = %orig;
+	if (gLogAll) {
+		if (result && [result rangeOfString:@"string-in-wrong-bundle"].location == NSNotFound) FZ(@"WALog: %@", result);
+		return result;
+	}
 	static NSArray *keys;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{

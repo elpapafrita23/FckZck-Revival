@@ -120,3 +120,8 @@ Optional keys in `/var/mobile/Library/Preferences/com.ifilipis.fckzck.plist`:
 ## 1.26.3
 
 On WhatsApp builds without `SharedModules.framework` (e.g. 2.25.1.83) the expiry/deprecation symbols are now searched in every image inside WhatsApp.app, and ObjC getters like `isBuildExpired` / `isPlatformDeprecated` are hooked to return NO. Candidates that were found but not hooked are written to `fckzck.log`.
+
+
+## 1.26.5 (diagnostics)
+
+`fckzck.log` now contains every WhatsApp log line (plist key `logAll` = false restores the filtered log) and every failed keychain call (OSStatus, service, access group). Used to find out why the server connection drops right after "Failed to save server static key".
