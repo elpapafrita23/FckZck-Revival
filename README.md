@@ -103,3 +103,15 @@ This is an unofficial project. It is not affiliated with, endorsed by, or connec
 
 - **ifilipis**, original author of FckZck.
 - **0xkuj**, author of blockWAUpdates, which the original project builds on.
+
+
+## iOS 15 spoof (1.26.2)
+
+WhatsApp now declares iOS 15.8.3 (build 19H386) to the server in `ClientPayload.UserAgent`.
+Optional keys in `/var/mobile/Library/Preferences/com.ifilipis.fckzck.plist`:
+
+| key | type | default | what it does |
+|---|---|---|---|
+| `osVersion` | string | `15.8.3` | OS version sent to the server. Empty string = send the real one |
+| `osBuildNumber` | string | `19H386` | OS build sent to the server. Empty string = real one |
+| `spoofLocalOS` | bool | `false` | also fake `UIDevice` / `NSProcessInfo` inside the app (can crash if WhatsApp starts using iOS 15-only APIs) |

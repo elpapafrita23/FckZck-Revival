@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #include <substrate.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
@@ -53,6 +54,19 @@ static BOOL gSkipEmptyRefCert = NO;  // default OFF = stock behaviour (skipping 
 // the override (the real iOS version is sent).
 static NSString *gOsVersion = nil;
 static NSString *gOsBuild = nil;
+#define DEFAULT_OS_VERSION @"15.8.3"
+#define DEFAULT_OS_BUILD   @"19H386"
+static BOOL gSpoofLocalOS = NO;   // also fake the OS version seen by the app itself (UIDevice/NSProcessInfo)
+
+// Parses gOsVersion ("15.8.3") into major/minor/patch.
+static NSOperatingSystemVersion FZFakeOsStruct(void) {
+    NSOperatingSystemVersion v = {15, 0, 0};
+    NSArray *p = [gOsVersion componentsSeparatedByString:@"."];
+    if (p.count > 0) v.majorVersion = [p[0] integerValue];
+    if (p.count > 1) v.minorVersion = [p[1] integerValue];
+    if (p.count > 2) v.patchVersion = [p[2] integerValue];
+    return v;
+}
 
 // ---- File logging -------------------------------------------------------
 // Writes to <app Documents>/fckzck.log (and NSLog). Lets you read the log with
@@ -146,10 +160,18 @@ static void FZLoadConfig(void) {
     FZ(@"FckZck: forceInitialSyncFinished=%d", gForceInitialSyncFinished);
     id fs = cfg[@"forceSyncState"];
     if ([fs isKindOfClass:[NSNumber class]]) { gForceSyncState = fs; FZ(@"FckZck: forceSyncState=%@", fs); } else { FZ(@"FckZck: forceSyncState default=%@", gForceSyncState); }
-    // Never consume legacy osVersion/osBuildNumber plist overrides.
-    gOsVersion = nil;
-    gOsBuild = nil;
-    FZ(@"FckZck 1.25: osVersion override=(off) osBuildNumber override=(off) (fixed)");
+    // 1.26.2: declare iOS 15 to the server (ClientPayload.UserAgent) and, optionally, to the app.
+    // plist keys: osVersion (string, "" = off, default 15.8.3), osBuildNumber (default 19H386),
+    //             spoofLocalOS (bool, default NO) = also fake UIDevice / NSProcessInfo inside the app.
+    gOsVersion = DEFAULT_OS_VERSION;
+    gOsBuild = DEFAULT_OS_BUILD;
+    id ov = cfg[@"osVersion"];
+    if ([ov isKindOfClass:[NSString class]]) gOsVersion = ([(NSString *)ov length] ? ov : nil);
+    id ob = cfg[@"osBuildNumber"];
+    if ([ob isKindOfClass:[NSString class]]) gOsBuild = ([(NSString *)ob length] ? ob : nil);
+    id sl = cfg[@"spoofLocalOS"];
+    if ([sl respondsToSelector:@selector(boolValue)]) gSpoofLocalOS = [sl boolValue];
+    FZ(@"FckZck 1.26.2: osVersion=%@ osBuildNumber=%@ spoofLocalOS=%d", gOsVersion ? gOsVersion : @"(off)", gOsBuild ? gOsBuild : @"(off)", gSpoofLocalOS);
     if ([v isKindOfClass:[NSString class]] && v.length) wanted = v;
     else FZ(@"FckZck: no config found, using default version");
 
@@ -952,6 +974,31 @@ static CFTypeRef new_CFBundleGetValue(CFBundleRef b, CFStringRef key) {
     }
     return r;
 }
+
+// ---- Local OS version spoof (only when spoofLocalOS = true) ----------------
+%hook UIDevice
+- (NSString *)systemVersion {
+    if (gSpoofLocalOS && gOsVersion.length) return gOsVersion;
+    return %orig;
+}
+%end
+
+%hook NSProcessInfo
+- (NSOperatingSystemVersion)operatingSystemVersion {
+    if (gSpoofLocalOS && gOsVersion.length) return FZFakeOsStruct();
+    return %orig;
+}
+- (BOOL)isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion)req {
+    if (gSpoofLocalOS && gOsVersion.length) {
+        NSOperatingSystemVersion c = FZFakeOsStruct();
+        if (c.majorVersion != req.majorVersion) return c.majorVersion > req.majorVersion;
+        if (c.minorVersion != req.minorVersion) return c.minorVersion > req.minorVersion;
+        return c.patchVersion >= req.patchVersion;
+    }
+    return %orig;
+}
+%end
+// -------------------------------------------------------------------------
 
 %hook NSBundle
 
